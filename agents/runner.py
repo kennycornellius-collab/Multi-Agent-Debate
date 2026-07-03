@@ -323,5 +323,11 @@ async def _smoke_test(instruction: str) -> None:
 
 
 if __name__ == "__main__":
+    # Model output is arbitrary Unicode; a Windows console's legacy codepage (e.g.
+    # cp1252) can't encode all of it and print() would crash. See agents/debate.py.
+    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     instruction = " ".join(sys.argv[1:]) or "write a haiku about pipelines"
     asyncio.run(_smoke_test(instruction))
