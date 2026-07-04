@@ -16,6 +16,11 @@ BUILD_MODEL = None
 MAX_BUDGET_USD_PER_CALL = 1.0  # passed as --max-budget-usd
 BUILD_MAX_TURNS = 30          # --max-turns for builder-mode agents
 
+# A single stream-json line can embed a whole tool result (e.g. the Reviewer/Tester
+# reading a source file back with their file tools) -- easily past asyncio's 64 KiB
+# StreamReader default, which raises ValueError/LimitOverrunError mid-run.
+STREAM_READ_LIMIT_BYTES = 20 * 1024 * 1024  # 20 MiB
+
 OUTPUT_DIR = "./output"
 HISTORY_FULL_ROUNDS = 2       # rounds that get the full transcript
 HISTORY_TAIL_MESSAGES = 6     # verbatim tail after that

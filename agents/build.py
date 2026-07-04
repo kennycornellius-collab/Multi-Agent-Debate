@@ -5,9 +5,6 @@ EventBus + run_id so Stage 4's FastAPI backend can drive the exact same
 function a browser-triggered run uses. Reads an *existing* agreed_spec.md
 from output/<run-id>/ (written by a prior run_debate() call) rather than
 taking spec text directly.
-
-Stage 3.1: Architect + Coder + the empty-build-dir guard. Reviewer and
-Tester are added in Stage 3.2.
 """
 
 from __future__ import annotations
@@ -84,11 +81,11 @@ async def _run_step(
 
 
 async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = None) -> dict:
-    """Run the build pipeline against an existing debate run. Returns a summary dict.
+    """Run the full build pipeline against an existing debate run. Returns a summary dict.
 
-    Stage 3.1 implements Architect + Coder plus the empty-build-dir guard; Reviewer
-    and Tester (Stage 3.2) are appended after the `files_updated` emit below, with no
-    restructuring of what's already here.
+    Architect and Coder failures are terminal (nothing downstream can proceed without
+    them); a Reviewer failure is not -- the Tester still runs, using a system-note
+    fallback in place of review.md.
     """
     out_dir = Path(output_dir) if output_dir else Path(config.OUTPUT_DIR) / run_id
     spec_path = out_dir / "agreed_spec.md"
@@ -101,6 +98,8 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
         "output_dir": str(out_dir),
         "architecture_path": None,
         "build_dir": None,
+        "review_path": None,
+        "tests_path": None,
         "build_ok": False,
         "total_cost_usd": 0.0,
     }
@@ -193,7 +192,71 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
 
     bus.emit(AgentEvent(type="files_updated", phase="build", content=json.dumps(files)))
 
-    # Stage 3.2 continues here: Reviewer, Tester, second files_updated, final phase_done.
+    # --- Reviewer ---
+    reviewer_prompt_file, reviewer_mode, reviewer_timeout = config.BUILD_AGENTS["Reviewer"]
+    reviewer_instruction = (
+        "Read the agreed spec on stdin and the code in the current working directory, "
+        "then produce the review document now, following your output-format rules exactly."
+    )
+    review_text, review_cost = await _run_step(
+        bus,
+        agent="Reviewer",
+        system_prompt_file=reviewer_prompt_file,
+        stdin_text=spec_text,
+        instruction=reviewer_instruction,
+        mode=reviewer_mode,
+        cwd=str(build_dir),
+        timeout=reviewer_timeout,
+    )
+    total_cost += review_cost
+    result["total_cost_usd"] = total_cost
+
+    review_path: Optional[Path] = None
+    if review_text is not None:
+        review_path = out_dir / "review.md"
+        review_path.write_text(review_text, encoding="utf-8")
+        result["review_path"] = str(review_path)
+        tester_stdin = review_text
+    else:
+        # Reviewer failing isn't terminal -- the Tester can still work directly off the
+        # code, it just loses the review's map of where the code is fragile.
+        result["review_path"] = None
+        tester_stdin = (
+            "Reviewer was unavailable this run; no review.md was produced. Use your own "
+            "judgment: read the source code directly and write tests for it."
+        )
+
+    # --- Tester ---
+    tester_prompt_file, tester_mode, tester_timeout = config.BUILD_AGENTS["Tester"]
+    tester_instruction = (
+        "Read the review on stdin (or use your own judgment if none was produced) and the "
+        "code in the current working directory, then create the test files directly and "
+        "follow your stdout-format rules exactly."
+    )
+    tests_text, tester_cost = await _run_step(
+        bus,
+        agent="Tester",
+        system_prompt_file=tester_prompt_file,
+        stdin_text=tester_stdin,
+        instruction=tester_instruction,
+        mode=tester_mode,
+        cwd=str(build_dir),
+        timeout=tester_timeout,
+    )
+    total_cost += tester_cost
+    result["total_cost_usd"] = total_cost
+
+    if tests_text is not None:
+        tests_path = out_dir / "tests.md"
+        tests_path.write_text(tests_text, encoding="utf-8")
+        result["tests_path"] = str(tests_path)
+    else:
+        result["tests_path"] = None
+
+    bus.emit(
+        AgentEvent(type="files_updated", phase="build", content=json.dumps(_walk_build_dir(build_dir)))
+    )
+    bus.emit(AgentEvent(type="phase_done", phase="build", content=json.dumps(result)))
 
     return result
 
@@ -231,6 +294,8 @@ async def _headless_main(run_id: str) -> None:
     print(f"\nrun_id: {result['run_id']}")
     print(f"architecture: {result['architecture_path']}")
     print(f"build_dir: {result['build_dir']} (build_ok={result['build_ok']})")
+    print(f"review: {result['review_path']}")
+    print(f"tests: {result['tests_path']}")
     print(f"total_cost_usd: ${result['total_cost_usd']:.4f}")
 
 

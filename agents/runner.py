@@ -109,6 +109,7 @@ async def _spawn(args: list[str], *, cwd: Optional[str]) -> asyncio.subprocess.P
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
+        limit=config.STREAM_READ_LIMIT_BYTES,
     )
 
 
@@ -280,13 +281,12 @@ async def _run_once(
 
     stderr_text = stderr_bytes.decode("utf-8", errors="replace")
 
-    if proc.returncode != 0:
-        tail = stderr_text.strip()[-STDERR_TAIL_CHARS:]
+    if proc.returncode != 0 or is_error:
+        # stderr is often empty even on failure (e.g. a budget/turn-limit abort reports
+        # its reason via the "result" NDJSON event, not stderr) -- prefer whichever
+        # actually has content instead of always defaulting to a bare exit code.
+        tail = (stderr_text or result_text or "").strip()[-STDERR_TAIL_CHARS:]
         raise AgentError(tail or f"claude exited with code {proc.returncode}")
-
-    if is_error:
-        tail = (result_text or stderr_text).strip()[-STDERR_TAIL_CHARS:]
-        raise AgentError(tail or "claude reported is_error=true")
 
     final_text = result_text if result_text is not None else "".join(full_text_parts)
     yield AgentEvent(
