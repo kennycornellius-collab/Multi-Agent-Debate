@@ -71,10 +71,16 @@ pip install -r requirements.txt
 python check_cli.py
 
 # Run the app
-uvicorn main:app --reload
+uvicorn main:app
 ```
 
 Then open the printed local URL, type an idea, and hit Run.
+
+> **Don't use `--reload` on Windows.** Uvicorn's auto-reload supervisor changes how the asyncio
+> event loop gets set up in a way that breaks `asyncio.create_subprocess_exec` — every agent call
+> fails instantly with an empty `NotImplementedError` (surfaces in the UI as a bare "internal
+> error:" with nothing after the colon). Plain `uvicorn main:app` runs fine; if you're iterating on
+> backend code, just re-run that command after each change instead of using `--reload`.
 
 ### Headless smoke tests (useful while a stage is still being built)
 
