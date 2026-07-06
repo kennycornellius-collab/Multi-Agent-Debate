@@ -135,10 +135,22 @@
 
   function handleEvent(ev) {
     switch (ev.type) {
-      case "agent_start":
-        getOrCreateCard(ev);
+      case "agent_start": {
+        const key = cardKey(ev);
+        const isRetry = state.cards.has(key);
+        const card = getOrCreateCard(ev);
+        if (isRetry) {
+          // A second agent_start for the same key means the previous attempt failed
+          // after streaming some partial text (retry-once logic in debate.py/build.py) --
+          // clear it so the retry's own output doesn't get concatenated onto the stale
+          // fragment left behind by the failed attempt.
+          card.body.textContent = "";
+          card.status.textContent = "streaming…";
+          card.el.classList.remove("error");
+        }
         updateProgress(ev);
         break;
+      }
       case "delta": {
         const card = getOrCreateCard(ev);
         const container = feedBodyFor(ev.phase);
