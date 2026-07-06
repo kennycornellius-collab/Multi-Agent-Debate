@@ -273,6 +273,16 @@ async def _run_once(
     except asyncio.TimeoutError:
         await _kill_process_tree(proc)
         stdin_task.cancel()
+        # stderr_task is a separate asyncio Task (not something this coroutine awaits
+        # in between), so asyncio.timeout() cancelling *this* coroutine does not also
+        # cancel it -- left uncancelled, it would keep running in the background
+        # unretrieved, and any exception it eventually raised would vanish silently
+        # ("Task exception was never retrieved") instead of surfacing anywhere.
+        stderr_task.cancel()
+        try:
+            await stderr_task
+        except asyncio.CancelledError:
+            pass
         raise AgentError(f"agent call timed out after {timeout}s")
     finally:
         # Never leave the feeder task unretrieved -- it only ever swallows its own errors.
