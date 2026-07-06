@@ -84,15 +84,21 @@ async def _run_turn(
     phase: str,
     round: Optional[int],
     timeout: Optional[int] = None,
-) -> tuple[Optional[str], float]:
+) -> tuple[Optional[str], float, bool]:
     """Run one agent turn, streaming deltas onto the bus. Retries once on AgentError;
-    on a second failure, emits an `error` event and returns (None, 0.0) so the caller
-    can add a system note and keep the debate going."""
+    on a second failure, emits an `error` event and returns (None, 0.0, False) so the
+    caller can add a system note and keep the debate going.
+
+    The third element of the return tuple is `truncated`: True if the CLI hit its
+    turn limit but had already produced usable output (see agents/runner.py) -- mirrors
+    build.py's _run_step, so a truncated debate turn is surfaced the same way a
+    truncated build step is, instead of being silently treated as a clean finish."""
     for attempt in (1, 2):
         bus.emit(AgentEvent(type="agent_start", phase=phase, round=round, agent=agent))
         try:
             full_text: Optional[str] = None
             cost_usd = 0.0
+            truncated = False
             async for event in run_agent_streaming(
                 system_prompt_file=system_prompt_file,
                 stdin_text=stdin_text,
@@ -108,16 +114,18 @@ async def _run_turn(
                 elif event.type == "result":
                     full_text = event.content
                     cost_usd = event.cost_usd or 0.0
-            bus.emit(AgentEvent(type="agent_done", phase=phase, round=round, agent=agent))
-            return full_text, cost_usd
+                    truncated = event.truncated
+            done_content = "hit the turn limit; using the output produced so far" if truncated else ""
+            bus.emit(AgentEvent(type="agent_done", phase=phase, round=round, agent=agent, content=done_content))
+            return full_text, cost_usd, truncated
         except AgentError as e:
             if attempt == 1:
                 continue
             tail = str(e).strip()[-500:]
             bus.emit(AgentEvent(type="error", phase=phase, round=round, agent=agent, content=tail))
-            return None, 0.0
+            return None, 0.0, False
 
-    return None, 0.0  # unreachable, keeps type checkers happy
+    return None, 0.0, False  # unreachable, keeps type checkers happy
 
 
 async def run_debate(
@@ -132,6 +140,7 @@ async def run_debate(
     history: list[dict] = []
     summary = ""
     total_cost = 0.0
+    warnings: list[str] = []
 
     for r in range(1, num_rounds + 1):
         for name, prompt_file in config.DEBATE_AGENTS:
@@ -140,7 +149,7 @@ async def run_debate(
                 f"You are speaking in round {r} of {num_rounds}. Read the transcript on stdin "
                 "and reply now, in character, following your role and output-format rules."
             )
-            text, cost = await _run_turn(
+            text, cost, truncated = await _run_turn(
                 bus,
                 agent=name,
                 system_prompt_file=prompt_file,
@@ -151,6 +160,8 @@ async def run_debate(
                 timeout=config.DEBATE_TIMEOUT,
             )
             total_cost += cost
+            if truncated:
+                warnings.append(f"{name} (round {r}) hit the turn limit; using the output produced so far.")
             if text is not None:
                 history.append({"round": r, "agent": name, "text": text})
                 if name == "Refiner":
@@ -162,7 +173,7 @@ async def run_debate(
     final_instruction = final_instruction_path.read_text(encoding="utf-8")
     final_stdin = render_transcript(idea, history, current_round=1, summary=summary)  # force full
 
-    final_text, final_cost = await _run_turn(
+    final_text, final_cost, final_truncated = await _run_turn(
         bus,
         agent="Refiner",
         system_prompt_file="debate/refiner.txt",
@@ -173,6 +184,8 @@ async def run_debate(
         timeout=config.DEBATE_TIMEOUT,
     )
     total_cost += final_cost
+    if final_truncated:
+        warnings.append("Refiner (final synthesis) hit the turn limit; using the output produced so far.")
 
     agreed_spec_path: Optional[Path] = None
     if final_text is not None:
@@ -185,6 +198,7 @@ async def run_debate(
         "num_rounds": num_rounds,
         "history": history,
         "total_cost_usd": total_cost,
+        "warnings": warnings,
     }
     (out_dir / "debate_log.json").write_text(json.dumps(debate_log, indent=2), encoding="utf-8")
 
@@ -196,6 +210,7 @@ async def run_debate(
                 {
                     "agreed_spec_path": str(agreed_spec_path) if agreed_spec_path else None,
                     "total_cost_usd": total_cost,
+                    "warnings": warnings,
                 }
             ),
         )
@@ -207,6 +222,7 @@ async def run_debate(
         "agreed_spec_path": str(agreed_spec_path) if agreed_spec_path else None,
         "history": history,
         "total_cost_usd": total_cost,
+        "warnings": warnings,
     }
 
 
@@ -238,6 +254,10 @@ async def _headless_main(idea: str, num_rounds: int) -> None:
     print(f"\nrun_id: {result['run_id']}")
     print(f"agreed_spec: {result['agreed_spec_path']}")
     print(f"total_cost_usd: ${result['total_cost_usd']:.4f}")
+    if result.get("warnings"):
+        print("warnings:")
+        for w in result["warnings"]:
+            print(f"  - {w}")
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
