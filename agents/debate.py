@@ -20,6 +20,11 @@ import config
 from agents.events import AgentEvent, EventBus
 from agents.runner import AgentError, run_agent_streaming
 
+# Half of the ~200-word running-summary budget (see CLAUDE.md's history policy) --
+# split between the prior summary's tail and the latest reply's head so one side can
+# never fully evict the other. See _update_summary's docstring for why.
+SUMMARY_HALF_WORDS = 100
+
 
 def render_transcript(idea: str, history: list[dict], *, current_round: int, summary: str) -> str:
     """Plain-text transcript rendering (not JSON -- models follow it better).
@@ -52,10 +57,21 @@ def render_transcript(idea: str, history: list[dict], *, current_round: int, sum
 
 
 def _update_summary(prev_summary: str, latest_refiner_text: str) -> str:
-    """Prepend the Refiner's latest reply to the running summary, cap at ~200 words.
-    No extra CLI call needed -- the Refiner's own synthesis IS the summary source."""
-    words = (latest_refiner_text + " " + prev_summary).split()
-    return " ".join(words[:200])
+    """Blend the Refiner's latest reply into the running summary, capped at ~200 words
+    total. No extra CLI call needed -- the Refiner's own synthesis IS the summary source.
+
+    Each side gets a fixed half of the budget (SUMMARY_HALF_WORDS each) rather than
+    prepending the latest reply and keeping the first 200 words combined -- refiner.txt
+    allows replies up to ~250 words, so a single reply could previously evict the entire
+    prior summary on its own (verified: after 3 rounds of ~200-word replies, 0 words
+    survived from round 1 and only 10/200 from round 2). Keeping the *tail* of the prior
+    summary (its most recently-added round) alongside the *head* of the latest reply
+    guarantees every round's ruling survives into at least the following round's prompt,
+    matching the Refiner's own convergence rule (don't relitigate the immediately
+    preceding round)."""
+    prev_words = prev_summary.split()[-SUMMARY_HALF_WORDS:]
+    latest_words = latest_refiner_text.split()[:SUMMARY_HALF_WORDS]
+    return " ".join(prev_words + latest_words)
 
 
 async def _run_turn(
