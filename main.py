@@ -14,7 +14,7 @@ import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -63,7 +63,11 @@ class RunState:
     phase: Optional[str] = None
     round: Optional[int] = None
     running: bool = True
-    error: Optional[str] = None
+    # Every error that happened during the run, in order -- not just the most recent
+    # one. A run can have several agents fail permanently at different points (e.g.
+    # Critic in round 1, Strategist in round 2); overwriting a single `error` field
+    # would silently drop all but the last one from /status and the reload banner.
+    errors: list[str] = field(default_factory=list)
     task: Optional[asyncio.Task] = None
 
 
@@ -81,24 +85,27 @@ class RunRequest(BaseModel):
 
 
 async def _watch_status(state: RunState) -> None:
-    """Keep RunState.phase/round/error in sync with the bus, for GET /status."""
+    """Keep RunState.phase/round/errors in sync with the bus, for GET /status."""
     async for ev in state.bus.stream():
         if ev.type == "agent_start":
             state.phase = ev.phase
             state.round = ev.round
         elif ev.type == "error":
-            state.error = ev.content
+            label = ev.agent or "system"
+            if ev.round is not None:
+                label += f" (round {ev.round})"
+            state.errors.append(f"{label}: {ev.content}")
         elif ev.type == "run_done":
             state.running = False
 
 
 async def _run_pipeline(state: RunState) -> None:
     watcher = asyncio.create_task(_watch_status(state))
-    # Separate from state.error: state.error is also written by _watch_status
+    # Separate from state.errors: state.errors is also appended to by _watch_status
     # (asynchronously, from per-agent `error` events) and nothing here awaits in
     # between an agent's error event and this function's finally block, so reading
-    # state.error for run_done's content would race the watcher and could embed a
-    # stale/empty value. fatal_error is only ever set synchronously, right here.
+    # state.errors for run_done's content would race the watcher and could embed a
+    # stale/incomplete value. fatal_error is only ever set synchronously, right here.
     fatal_error: Optional[str] = None
     try:
         debate_result = await run_debate(
@@ -119,7 +126,7 @@ async def _run_pipeline(state: RunState) -> None:
     finally:
         state.running = False
         if fatal_error:
-            state.error = fatal_error
+            state.errors.append(fatal_error)
         state.bus.emit(AgentEvent(type="run_done", content=fatal_error or ""))
         state.bus.close()
         await watcher
@@ -190,7 +197,9 @@ async def status(run_id: str) -> dict:
         "phase": state.phase,
         "round": state.round,
         "running": state.running,
-        "error": state.error,
+        # Joined so the response schema stays a single string (per SPEC.md), but now
+        # reflects every failure that occurred during the run, not just the last one.
+        "error": "; ".join(state.errors) if state.errors else None,
     }
 
 
