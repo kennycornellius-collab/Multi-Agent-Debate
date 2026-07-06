@@ -32,6 +32,9 @@ class AgentEvent:
     content: meaning depends on `type` (delta text, error message, file
              listing JSON, full result text, ...)
     cost_usd: populated on `result` events when the CLI reports a cost
+    truncated: on a `result` event, True if the CLI hit its turn limit before
+               finishing (subtype "error_max_turns") but had already produced
+               usable output -- see agents/runner.py. False for a clean finish.
     """
 
     type: str
@@ -40,6 +43,7 @@ class AgentEvent:
     agent: Optional[str] = None
     content: str = ""
     cost_usd: Optional[float] = None
+    truncated: bool = False
     seq: int = 0  # stamped by EventBus.emit; 0 until then
 
     def to_dict(self) -> dict:

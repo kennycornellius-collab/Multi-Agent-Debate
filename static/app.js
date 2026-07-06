@@ -149,7 +149,7 @@
       }
       case "agent_done": {
         const card = getOrCreateCard(ev);
-        card.status.textContent = "done";
+        card.status.textContent = ev.content ? `done (${ev.content})` : "done";
         break;
       }
       case "error": {

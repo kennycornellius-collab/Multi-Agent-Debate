@@ -43,16 +43,21 @@ async def _run_step(
     mode: str,
     cwd: Optional[str] = None,
     timeout: Optional[int] = None,
-) -> tuple[Optional[str], float]:
+) -> tuple[Optional[str], float, bool]:
     """Run one build step, streaming deltas onto the bus. Retries once on AgentError;
-    on a second failure, emits an `error` event and returns (None, 0.0) so the caller
-    can decide how the pipeline continues. Mirrors debate.py's _run_turn, minus the
-    per-round concept and plus `cwd` for builder-mode steps."""
+    on a second failure, emits an `error` event and returns (None, 0.0, False) so the
+    caller can decide how the pipeline continues. Mirrors debate.py's _run_turn, minus
+    the per-round concept and plus `cwd` for builder-mode steps.
+
+    The third element of the return tuple is `truncated`: True if the CLI hit its
+    turn limit but had already produced usable output (see agents/runner.py) -- the
+    step is treated as complete, but the caller may want to flag it as a warning."""
     for attempt in (1, 2):
         bus.emit(AgentEvent(type="agent_start", phase="build", agent=agent))
         try:
             full_text: Optional[str] = None
             cost_usd = 0.0
+            truncated = False
             async for event in run_agent_streaming(
                 system_prompt_file=system_prompt_file,
                 stdin_text=stdin_text,
@@ -68,16 +73,18 @@ async def _run_step(
                 elif event.type == "result":
                     full_text = event.content
                     cost_usd = event.cost_usd or 0.0
-            bus.emit(AgentEvent(type="agent_done", phase="build", agent=agent))
-            return full_text, cost_usd
+                    truncated = event.truncated
+            done_content = "hit the turn limit; using the output produced so far" if truncated else ""
+            bus.emit(AgentEvent(type="agent_done", phase="build", agent=agent, content=done_content))
+            return full_text, cost_usd, truncated
         except AgentError as e:
             if attempt == 1:
                 continue
             tail = str(e).strip()[-500:]
             bus.emit(AgentEvent(type="error", phase="build", agent=agent, content=tail))
-            return None, 0.0
+            return None, 0.0, False
 
-    return None, 0.0  # unreachable, keeps type checkers happy
+    return None, 0.0, False  # unreachable, keeps type checkers happy
 
 
 async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = None) -> dict:
@@ -102,6 +109,7 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
         "tests_path": None,
         "build_ok": False,
         "total_cost_usd": 0.0,
+        "warnings": [],
     }
     total_cost = 0.0
 
@@ -111,7 +119,7 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
         "Read the agreed spec on stdin and produce the architecture document now, "
         "following your role and output-format rules exactly."
     )
-    arch_text, arch_cost = await _run_step(
+    arch_text, arch_cost, arch_truncated = await _run_step(
         bus,
         agent="Architect",
         system_prompt_file=arch_prompt_file,
@@ -122,6 +130,8 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
     )
     total_cost += arch_cost
     result["total_cost_usd"] = total_cost
+    if arch_truncated:
+        result["warnings"].append("Architect hit the turn limit; using the output produced so far.")
 
     if arch_text is None:
         bus.emit(
@@ -155,7 +165,7 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
         "directly in the current working directory following the File Tree and Build Order. "
         "Follow your stdout-format rules exactly."
     )
-    _, coder_cost = await _run_step(
+    _, coder_cost, coder_truncated = await _run_step(
         bus,
         agent="Coder",
         system_prompt_file=coder_prompt_file,
@@ -167,6 +177,8 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
     )
     total_cost += coder_cost
     result["total_cost_usd"] = total_cost
+    if coder_truncated:
+        result["warnings"].append("Coder hit the turn limit; using the output produced so far.")
 
     files = _walk_build_dir(build_dir)
     build_ok = bool(files)
@@ -198,7 +210,7 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
         "Read the agreed spec on stdin and the code in the current working directory, "
         "then produce the review document now, following your output-format rules exactly."
     )
-    review_text, review_cost = await _run_step(
+    review_text, review_cost, review_truncated = await _run_step(
         bus,
         agent="Reviewer",
         system_prompt_file=reviewer_prompt_file,
@@ -210,6 +222,8 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
     )
     total_cost += review_cost
     result["total_cost_usd"] = total_cost
+    if review_truncated:
+        result["warnings"].append("Reviewer hit the turn limit; using the output produced so far.")
 
     review_path: Optional[Path] = None
     if review_text is not None:
@@ -233,7 +247,7 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
         "code in the current working directory, then create the test files directly and "
         "follow your stdout-format rules exactly."
     )
-    tests_text, tester_cost = await _run_step(
+    tests_text, tester_cost, tester_truncated = await _run_step(
         bus,
         agent="Tester",
         system_prompt_file=tester_prompt_file,
@@ -245,6 +259,8 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
     )
     total_cost += tester_cost
     result["total_cost_usd"] = total_cost
+    if tester_truncated:
+        result["warnings"].append("Tester hit the turn limit; using the output produced so far.")
 
     if tests_text is not None:
         tests_path = out_dir / "tests.md"
@@ -297,6 +313,10 @@ async def _headless_main(run_id: str) -> None:
     print(f"review: {result['review_path']}")
     print(f"tests: {result['tests_path']}")
     print(f"total_cost_usd: ${result['total_cost_usd']:.4f}")
+    if result.get("warnings"):
+        print("warnings:")
+        for w in result["warnings"]:
+            print(f"  - {w}")
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ from agents.debate import run_debate
 from agents.events import AgentEvent, EventBus
 from agents.runner import AgentError
 from check_cli import run_preflight
+
+logger = logging.getLogger(__name__)
 
 OUTPUT_ROOT = Path(config.OUTPUT_DIR).resolve()
 STATIC_DIR = Path("static")
@@ -108,6 +111,10 @@ async def _run_pipeline(state: RunState) -> None:
     except AgentError as e:
         fatal_error = str(e)
     except Exception as e:  # a bug here must not leave the run stuck as "running" forever
+        # The UI only ever shows the stringified exception -- log the full traceback
+        # server-side too, or a genuine bug is nearly impossible to diagnose from the
+        # browser alone (see the Stage 5 --reload gotcha in progress.md).
+        logger.exception("Unhandled error in _run_pipeline (run_id=%s)", state.run_id)
         fatal_error = f"internal error: {e}"
     finally:
         state.running = False

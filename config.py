@@ -14,7 +14,11 @@ TESTER_TIMEOUT = 600
 DEBATE_MODEL = None           # None = CLI default; can set e.g. a cheaper model name
 BUILD_MODEL = None
 MAX_BUDGET_USD_PER_CALL = 1.0  # passed as --max-budget-usd
-BUILD_MAX_TURNS = 30          # --max-turns for builder-mode agents
+# --max-turns for builder-mode agents. 30 proved tight for write-heavy sessions
+# (Coder/Tester reading several files, editing, and reasoning about each) and was
+# observed hitting "error_max_turns" after streaming an apparently complete reply --
+# see agents/runner.py's handling of that subtype.
+BUILD_MAX_TURNS = 60
 
 # A single stream-json line can embed a whole tool result (e.g. the Reviewer/Tester
 # reading a source file back with their file tools) -- easily past asyncio's 64 KiB

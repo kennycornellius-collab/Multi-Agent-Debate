@@ -220,6 +220,7 @@ async def _run_once(
             result_text: Optional[str] = None
             cost_usd: Optional[float] = None
             is_error = False
+            result_subtype: Optional[str] = None
 
             async for raw_line in proc.stdout:
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -263,6 +264,7 @@ async def _run_once(
                     result_text = obj.get("result")
                     cost_usd = obj.get("total_cost_usd")
                     is_error = bool(obj.get("is_error"))
+                    result_subtype = obj.get("subtype")
 
                 # system / rate_limit_event / anything else: ignore gracefully.
 
@@ -280,15 +282,28 @@ async def _run_once(
             pass
 
     stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+    final_text = result_text if result_text is not None else "".join(full_text_parts)
 
     if proc.returncode != 0 or is_error:
+        # A max-turns cutoff (subtype "error_max_turns") can land after the agent has
+        # already streamed a complete-looking reply -- or, for builder-mode agents,
+        # already written real files via tool calls -- before running out of turns.
+        # The CLI's exit code / is_error flag alone can't tell that apart from a
+        # genuine failure. If real output was already collected, treat this as a
+        # truncated-but-usable result instead of raising: callers shouldn't discard
+        # good output, or pay for a retry that mostly just redoes completed work.
+        if result_subtype == "error_max_turns" and final_text:
+            yield AgentEvent(
+                type="result", phase=phase, round=round, agent=agent,
+                content=final_text, cost_usd=cost_usd, truncated=True,
+            )
+            return
         # stderr is often empty even on failure (e.g. a budget/turn-limit abort reports
         # its reason via the "result" NDJSON event, not stderr) -- prefer whichever
         # actually has content instead of always defaulting to a bare exit code.
         tail = (stderr_text or result_text or "").strip()[-STDERR_TAIL_CHARS:]
         raise AgentError(tail or f"claude exited with code {proc.returncode}")
 
-    final_text = result_text if result_text is not None else "".join(full_text_parts)
     yield AgentEvent(
         type="result", phase=phase, round=round, agent=agent, content=final_text, cost_usd=cost_usd
     )
