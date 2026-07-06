@@ -62,6 +62,13 @@ imports the `anthropic` SDK, never calls `api.anthropic.com`, and never reads an
 working, the app tells you so with the CLI's own error message instead of pretending to have its
 own auth flow.
 
+## Prerequisites
+
+- Python 3.11+
+- The [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/overview) installed and
+  already logged in — run `claude` once interactively first if you haven't. This app has no
+  auth flow of its own; it's entirely riding on your existing CLI session.
+
 ## Quick start
 
 ```bash
