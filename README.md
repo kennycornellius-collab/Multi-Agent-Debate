@@ -5,11 +5,6 @@ spec, and then a second team of agents builds it — real files, on disk. Every 
 the **Claude Code CLI** running on your machine. There's no API key, no billing dashboard, no
 `anthropic` SDK anywhere in this repo — if you can run `claude` in your terminal, you can run this.
 
-> This README is the pitch and the user-facing design doc — what the thing is and how it feels to
-> use. For the full technical contract (CLI flags, event schema, endpoints, exact prompts), see
-> [`SPEC.md`](./SPEC.md). For a running build log of what's actually been implemented so far, see
-> [`progress.md`](./progress.md).
-
 ---
 
 ## Why
@@ -113,12 +108,6 @@ static/              Plain HTML/CSS/JS frontend -- no build step
 output/<run-id>/     Everything a run produces (gitignored)
 ```
 
-## Status
-
-This is being built stage-by-stage (scaffold -> runner -> debate -> build -> backend -> frontend ->
-hardening), one stage per work session, each with its own pass/fail check before moving on. See
-[`progress.md`](./progress.md) for exactly what's done, what decisions were made and why, and
-what's left.
 
 ## Configuration
 
