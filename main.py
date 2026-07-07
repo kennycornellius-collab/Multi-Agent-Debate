@@ -27,7 +27,7 @@ import config
 from agents.build import run_build
 from agents.debate import run_debate
 from agents.events import AgentEvent, EventBus
-from agents.runner import AgentError
+from agents.runner import AgentError, run_agent
 from check_cli import run_preflight
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,8 @@ class RunState:
     num_rounds: int
     phase: Optional[str] = None
     round: Optional[int] = None
+    model: Optional[str] = None
+    effort: Optional[str] = None
     running: bool = True
     # Every error that happened during the run, in order -- not just the most recent
     # one. A run can have several agents fail permanently at different points (e.g.
@@ -82,6 +84,18 @@ class RunRequest(BaseModel):
     # The build pipeline (agents/build.py) always runs its fixed four steps --
     # there is no per-run agent subset to wire this into yet.
     agents: list[str] = []
+    # Optional per-run overrides for the whole pipeline (debate + build agents alike),
+    # passed straight to the `claude` CLI's --model/--effort flags. None/omitted means
+    # "use config.py's DEBATE_MODEL/BUILD_MODEL default", unchanged from before these
+    # existed. Not restricted to config.AVAILABLE_MODELS -- that list is only the
+    # browser UI's curated dropdown; POST /models/check is how an arbitrary value gets
+    # verified.
+    model: Optional[str] = None
+    effort: Optional[str] = None
+
+
+class ModelCheckRequest(BaseModel):
+    model: str
 
 
 async def _watch_status(state: RunState) -> None:
@@ -109,10 +123,15 @@ async def _run_pipeline(state: RunState) -> None:
     fatal_error: Optional[str] = None
     try:
         debate_result = await run_debate(
-            idea=state.idea, num_rounds=state.num_rounds, bus=state.bus, run_id=state.run_id
+            idea=state.idea,
+            num_rounds=state.num_rounds,
+            bus=state.bus,
+            run_id=state.run_id,
+            model=state.model,
+            effort=state.effort,
         )
         if debate_result.get("agreed_spec_path"):
-            await run_build(run_id=state.run_id, bus=state.bus)
+            await run_build(run_id=state.run_id, bus=state.bus, model=state.model, effort=state.effort)
         else:
             fatal_error = "Debate phase ended without an agreed spec; build phase skipped."
     except AgentError as e:
@@ -156,6 +175,13 @@ async def index() -> str:
     )
 
 
+@app.get("/config")
+async def get_ui_config() -> dict:
+    """Curated model/effort options for the browser UI's dropdown + slider, sourced
+    straight from config.py so the frontend never carries its own duplicate list."""
+    return {"models": config.AVAILABLE_MODELS, "effort_levels": config.AVAILABLE_EFFORT_LEVELS}
+
+
 @app.post("/run")
 async def start_run(req: RunRequest) -> dict:
     if not preflight_ok:
@@ -163,12 +189,50 @@ async def start_run(req: RunRequest) -> dict:
     if not req.idea.strip():
         raise HTTPException(status_code=400, detail="idea must not be empty")
 
+    model = req.model.strip() if req.model and req.model.strip() else None
+    effort = req.effort.strip() if req.effort and req.effort.strip() else None
+    if effort and effort not in config.AVAILABLE_EFFORT_LEVELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid effort {effort!r}; must be one of {config.AVAILABLE_EFFORT_LEVELS}",
+        )
+
     run_id = uuid.uuid4().hex[:8]
     bus = EventBus()
-    state = RunState(run_id=run_id, bus=bus, idea=req.idea, num_rounds=req.num_rounds)
+    state = RunState(
+        run_id=run_id, bus=bus, idea=req.idea, num_rounds=req.num_rounds, model=model, effort=effort
+    )
     runs[run_id] = state
     state.task = asyncio.create_task(_run_pipeline(state))
     return {"run_id": run_id}
+
+
+@app.post("/models/check")
+async def check_model(req: ModelCheckRequest) -> dict:
+    """Cheap real availability probe for the browser UI's model dropdown/custom input.
+
+    An invalid --model fails fast and free (confirmed against the real CLI: ~1s,
+    total_cost_usd=0, is_error=True with a clear message) -- so this just makes that
+    same real call and reports what actually happened, instead of guessing from a
+    hardcoded list. A valid model incurs one small real call.
+    """
+    if not preflight_ok:
+        raise HTTPException(status_code=503, detail=preflight_message)
+    model = req.model.strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="model must not be empty")
+    try:
+        await run_agent(
+            system_prompt_file="debate/strategist.txt",
+            stdin_text="(availability check -- ignore persona constraints, just answer the instruction)\n",
+            instruction="Reply with the single word: ok",
+            mode="text_only",
+            model=model,
+            timeout=60,
+        )
+        return {"available": True, "message": ""}
+    except AgentError as e:
+        return {"available": False, "message": str(e)}
 
 
 @app.get("/stream/{run_id}")

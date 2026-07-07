@@ -39,6 +39,8 @@ def _build_args(
     instruction: str,
     mode: Literal["text_only", "builder"],
     include_budget_flag: bool,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
 ) -> list[str]:
     args = [
         "-p",
@@ -53,7 +55,7 @@ def _build_args(
 
     if mode == "text_only":
         args += ["--tools", "", "--max-turns", "1"]
-        model = config.DEBATE_MODEL
+        default_model = config.DEBATE_MODEL
     elif mode == "builder":
         args += [
             "--permission-mode",
@@ -61,12 +63,19 @@ def _build_args(
             "--max-turns",
             str(config.BUILD_MAX_TURNS),
         ]
-        model = config.BUILD_MODEL
+        default_model = config.BUILD_MODEL
     else:
         raise AgentError(f"unknown mode: {mode!r}")
 
-    if model:
-        args += ["--model", model]
+    # An explicit per-call override (e.g. from the browser UI) wins over config.py's
+    # per-mode default; config.py's None-means-CLI-default behavior is unchanged for
+    # any caller that doesn't pass one.
+    resolved_model = model or default_model
+    if resolved_model:
+        args += ["--model", resolved_model]
+
+    if effort:
+        args += ["--effort", effort]
 
     if include_budget_flag:
         args += ["--max-budget-usd", str(config.MAX_BUDGET_USD_PER_CALL)]
@@ -124,11 +133,17 @@ async def run_agent_streaming(
     round: Optional[int] = None,
     cwd: Optional[str] = None,
     timeout: Optional[int] = None,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
 ) -> AsyncIterator[AgentEvent]:
     """Spawn the `claude` CLI for one agent turn and yield AgentEvents as output streams in.
 
     Yields `delta` events as text arrives, then a final `result` event carrying the
     full text and reported cost. Raises AgentError on nonzero exit or timeout.
+
+    `model`/`effort` are optional per-call overrides (e.g. from the browser UI); when
+    omitted, `_build_args` falls back to config.py's per-mode DEBATE_MODEL/BUILD_MODEL
+    default, unchanged from before these params existed.
 
     Guarded --max-budget-usd: if the CLI rejects the flag as unrecognized (older/newer
     builds), retry once without it -- transparently, before any output has been yielded.
@@ -150,6 +165,8 @@ async def run_agent_streaming(
         round=round,
         cwd=cwd,
         timeout=timeout,
+        model=model,
+        effort=effort,
     )
 
     gen = _run_once(**common_kwargs, include_budget_flag=True)
@@ -182,12 +199,16 @@ async def _run_once(
     cwd: Optional[str],
     timeout: int,
     include_budget_flag: bool,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
 ) -> AsyncIterator[AgentEvent]:
     args = _build_args(
         prompt_path=prompt_path,
         instruction=instruction,
         mode=mode,
         include_budget_flag=include_budget_flag,
+        model=model,
+        effort=effort,
     )
     proc = await _spawn(args, cwd=cwd)
 

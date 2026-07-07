@@ -43,6 +43,8 @@ async def _run_step(
     mode: str,
     cwd: Optional[str] = None,
     timeout: Optional[int] = None,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
 ) -> tuple[Optional[str], float, bool]:
     """Run one build step, streaming deltas onto the bus. Retries once on AgentError;
     on a second failure, emits an `error` event and returns (None, 0.0, False) so the
@@ -67,6 +69,8 @@ async def _run_step(
                 phase="build",
                 cwd=cwd,
                 timeout=timeout,
+                model=model,
+                effort=effort,
             ):
                 if event.type == "delta":
                     bus.emit(event)
@@ -87,12 +91,23 @@ async def _run_step(
     return None, 0.0, False  # unreachable, keeps type checkers happy
 
 
-async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = None) -> dict:
+async def run_build(
+    *,
+    run_id: str,
+    bus: EventBus,
+    output_dir: Optional[str] = None,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+) -> dict:
     """Run the full build pipeline against an existing debate run. Returns a summary dict.
 
     Architect and Coder failures are terminal (nothing downstream can proceed without
     them); a Reviewer failure is not -- the Tester still runs, using a system-note
     fallback in place of review.md.
+
+    `model`/`effort` are optional per-run overrides (e.g. from the browser UI) applied to
+    all four steps; omitted, they fall back to config.py's BUILD_MODEL default via
+    agents/runner.py.
     """
     out_dir = Path(output_dir) if output_dir else Path(config.OUTPUT_DIR) / run_id
     spec_path = out_dir / "agreed_spec.md"
@@ -127,6 +142,8 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
         instruction=arch_instruction,
         mode=arch_mode,
         timeout=arch_timeout,
+        model=model,
+        effort=effort,
     )
     total_cost += arch_cost
     result["total_cost_usd"] = total_cost
@@ -174,6 +191,8 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
         mode=coder_mode,
         cwd=str(build_dir),
         timeout=coder_timeout,
+        model=model,
+        effort=effort,
     )
     total_cost += coder_cost
     result["total_cost_usd"] = total_cost
@@ -219,6 +238,8 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
         mode=reviewer_mode,
         cwd=str(build_dir),
         timeout=reviewer_timeout,
+        model=model,
+        effort=effort,
     )
     total_cost += review_cost
     result["total_cost_usd"] = total_cost
@@ -256,6 +277,8 @@ async def run_build(*, run_id: str, bus: EventBus, output_dir: Optional[str] = N
         mode=tester_mode,
         cwd=str(build_dir),
         timeout=tester_timeout,
+        model=model,
+        effort=effort,
     )
     total_cost += tester_cost
     result["total_cost_usd"] = total_cost

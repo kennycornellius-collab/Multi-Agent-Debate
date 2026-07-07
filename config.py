@@ -14,6 +14,21 @@ TESTER_TIMEOUT = 600
 DEBATE_MODEL = None           # None = CLI default; can set e.g. a cheaper model name
 BUILD_MODEL = None
 MAX_BUDGET_USD_PER_CALL = 1.0  # passed as --max-budget-usd
+
+# Curated model aliases offered in the browser UI's dropdown (main.py's /run and
+# /models/check accept any string, not just these -- this list is just what's
+# offered by default; a user can still type/POST a newer alias or full model name
+# as new models ship). Not validated against server-side: /models/check exists
+# precisely so an unlisted or unavailable name gets a real answer instead of a
+# guess. Mirrors the CLI's own --model help text (aliases for the latest models).
+AVAILABLE_MODELS = ["sonnet", "opus", "haiku", "fable"]
+
+# The CLI's --effort choices verbatim (confirmed via `claude --help`). Unlike an
+# invalid --model (which the CLI rejects with a clear, free, fast error), an
+# invalid --effort value is silently ignored with just a stderr warning -- so
+# this list is validated server-side in main.py (400 on a bad value) rather than
+# relying on the CLI to catch it.
+AVAILABLE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
 # --max-turns for builder-mode agents. 30 proved tight for write-heavy sessions
 # (Coder/Tester reading several files, editing, and reasoning about each) and was
 # observed hitting "error_max_turns" after streaming an apparently complete reply --

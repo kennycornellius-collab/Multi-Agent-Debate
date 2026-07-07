@@ -5,11 +5,16 @@
   const BUILD_ORDER = ["Architect", "Coder", "Reviewer", "Tester"];
   const FILE_PRIORITY = ["agreed_spec.md", "architecture.md", "review.md", "tests.md"];
   const SCROLL_BOTTOM_THRESHOLD = 40;
+  const MODEL_CHECK_DEBOUNCE_MS = 400;
 
   const ideaInput = document.getElementById("idea");
   const roundsInput = document.getElementById("rounds");
   const runBtn = document.getElementById("run-btn");
   const runErrorEl = document.getElementById("run-error");
+  const modelSelect = document.getElementById("model-select");
+  const modelStatusEl = document.getElementById("model-status");
+  const effortSlider = document.getElementById("effort-slider");
+  const effortLabelEl = document.getElementById("effort-label");
   const progressFill = document.getElementById("progress-fill");
   const progressLabel = document.getElementById("progress-label");
   const debateFeedBody = document.querySelector("#debate-feed .feed-body");
@@ -23,6 +28,10 @@
     eventSource: null,
     cards: new Map(), // key -> { el, body, status }
     selectedFile: null,
+    // effortChoices[0] is always "" (Default); effortChoices[i] for i>0 is a real
+    // --effort value, in the order config.py's AVAILABLE_EFFORT_LEVELS lists them.
+    effortChoices: [""],
+    modelCheckSeq: 0, // guards against a stale check response overwriting a newer one
   };
 
   function clamp(n, lo, hi) {
@@ -50,6 +59,82 @@
 
   function clearPersistedRun() {
     localStorage.removeItem(STORAGE_KEY);
+  }
+
+  function capitalize(s) {
+    return s.charAt(0).toUpperCase() + s.slice(1);
+  }
+
+  function currentEffort() {
+    return state.effortChoices[parseInt(effortSlider.value, 10)] || "";
+  }
+
+  function updateEffortLabel() {
+    const effort = currentEffort();
+    effortLabelEl.textContent = effort ? capitalize(effort) : "Default";
+  }
+
+  async function loadUiConfig() {
+    try {
+      const res = await fetch("/config");
+      if (!res.ok) return;
+      const data = await res.json();
+      for (const model of data.models || []) {
+        const opt = document.createElement("option");
+        opt.value = model;
+        opt.textContent = capitalize(model);
+        modelSelect.appendChild(opt);
+      }
+      state.effortChoices = ["", ...(data.effort_levels || [])];
+      effortSlider.max = String(state.effortChoices.length - 1);
+    } catch {
+      // /config unreachable: dropdown just stays at "Default" and the slider covers
+      // only the Default position -- run() still works, just without overrides.
+    }
+    updateEffortLabel();
+  }
+
+  function setModelStatus(text, cls) {
+    modelStatusEl.textContent = text;
+    modelStatusEl.className = `model-status${cls ? ` ${cls}` : ""}`;
+  }
+
+  let modelCheckTimer = null;
+
+  function scheduleModelCheck() {
+    const model = modelSelect.value;
+    clearTimeout(modelCheckTimer);
+    if (!model) {
+      setModelStatus("", "");
+      return;
+    }
+    setModelStatus("checking…", "checking");
+    modelCheckTimer = setTimeout(() => checkModel(model), MODEL_CHECK_DEBOUNCE_MS);
+  }
+
+  async function checkModel(model) {
+    const seq = ++state.modelCheckSeq;
+    try {
+      const res = await fetch("/models/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+      if (seq !== state.modelCheckSeq || modelSelect.value !== model) return; // stale
+      if (!res.ok) {
+        setModelStatus((await safeDetail(res)) || `check failed (${res.status})`, "unavailable");
+        return;
+      }
+      const data = await res.json();
+      if (data.available) {
+        setModelStatus("✓ available", "available");
+      } else {
+        setModelStatus(`✗ ${data.message || "not available"}`, "unavailable");
+      }
+    } catch (err) {
+      if (seq !== state.modelCheckSeq || modelSelect.value !== model) return;
+      setModelStatus(`network error: ${err.message}`, "unavailable");
+    }
   }
 
   function feedBodyFor(phase) {
@@ -241,13 +326,15 @@
       return;
     }
     const numRounds = clamp(parseInt(roundsInput.value, 10) || 3, 1, 8);
+    const model = modelSelect.value || null;
+    const effort = currentEffort() || null;
 
     runBtn.disabled = true;
     try {
       const res = await fetch("/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ idea, num_rounds: numRounds, agents: [] }),
+        body: JSON.stringify({ idea, num_rounds: numRounds, agents: [], model, effort }),
       });
       if (!res.ok) {
         showError((await safeDetail(res)) || `Request failed (${res.status})`);
@@ -367,5 +454,10 @@
   }
 
   runBtn.addEventListener("click", startRun);
-  window.addEventListener("DOMContentLoaded", tryRecoverRun);
+  modelSelect.addEventListener("change", scheduleModelCheck);
+  effortSlider.addEventListener("input", updateEffortLabel);
+  window.addEventListener("DOMContentLoaded", () => {
+    loadUiConfig();
+    tryRecoverRun();
+  });
 })();

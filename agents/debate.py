@@ -84,6 +84,8 @@ async def _run_turn(
     phase: str,
     round: Optional[int],
     timeout: Optional[int] = None,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
 ) -> tuple[Optional[str], float, bool]:
     """Run one agent turn, streaming deltas onto the bus. Retries once on AgentError;
     on a second failure, emits an `error` event and returns (None, 0.0, False) so the
@@ -108,6 +110,8 @@ async def _run_turn(
                 phase=phase,
                 round=round,
                 timeout=timeout,
+                model=model,
+                effort=effort,
             ):
                 if event.type == "delta":
                     bus.emit(event)
@@ -129,10 +133,21 @@ async def _run_turn(
 
 
 async def run_debate(
-    *, idea: str, num_rounds: int, bus: EventBus, run_id: str, output_dir: Optional[str] = None
+    *,
+    idea: str,
+    num_rounds: int,
+    bus: EventBus,
+    run_id: str,
+    output_dir: Optional[str] = None,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
 ) -> dict:
     """Run the full debate loop + final synthesis. Returns a summary dict; always writes
-    debate_log.json, and writes agreed_spec.md only if the final synthesis succeeded."""
+    debate_log.json, and writes agreed_spec.md only if the final synthesis succeeded.
+
+    `model`/`effort` are optional per-run overrides (e.g. from the browser UI) applied to
+    every agent call in this run, debate and final synthesis alike; omitted, they fall
+    back to config.py's DEBATE_MODEL default via agents/runner.py."""
     num_rounds = max(1, min(num_rounds, config.MAX_DEBATE_ROUNDS))
     out_dir = Path(output_dir) if output_dir else Path(config.OUTPUT_DIR) / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -158,6 +173,8 @@ async def run_debate(
                 phase="debate",
                 round=r,
                 timeout=config.DEBATE_TIMEOUT,
+                model=model,
+                effort=effort,
             )
             total_cost += cost
             if truncated:
@@ -182,6 +199,8 @@ async def run_debate(
         phase="debate",
         round=None,
         timeout=config.DEBATE_TIMEOUT,
+        model=model,
+        effort=effort,
     )
     total_cost += final_cost
     if final_truncated:

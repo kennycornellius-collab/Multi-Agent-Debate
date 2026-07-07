@@ -111,6 +111,40 @@ h2 { font-size: 1rem; margin: 0 0 0.5rem; color: var(--muted); }
 
 #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+#model-row { flex-wrap: wrap; font-size: 0.85rem; }
+
+#model-row label { color: var(--muted); }
+
+#model-select {
+  font: inherit;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  color: var(--fg);
+}
+
+.model-status {
+  font-size: 0.8rem;
+  color: var(--muted);
+  min-width: 1rem;
+}
+
+.model-status.checking { color: var(--muted); }
+.model-status.available { color: var(--refiner); }
+.model-status.unavailable { color: var(--error-fg); }
+
+#effort-slider {
+  width: 8rem;
+  accent-color: var(--accent);
+}
+
+#effort-label {
+  font-size: 0.8rem;
+  color: var(--muted);
+  min-width: 4.5rem;
+}
+
 .error-banner {
   background: var(--error-bg);
   color: var(--error-fg);
