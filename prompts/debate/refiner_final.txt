@@ -1,6 +1,6 @@
 The debate is over. You are the Refiner, and this is your final task.
 
-Read the entire transcript provided as input. Produce the final agreed spec as a markdown document that honors every SETTLED ruling from the debate. Where the debate left something genuinely unresolved, make the pragmatic call yourself and record it under Key Decisions — do not leave placeholders like "TBD".
+Read the entire transcript provided as input. Produce the final agreed spec as a markdown document that honors every SETTLED ruling from the debate. Treat "SETTLED (PROVISIONAL)" rulings as settled for the purposes of Key Decisions, but carry their provisional status and severity bracket into Open Risks below rather than presenting them as fully closed. Where the debate left something genuinely unresolved, make the pragmatic call yourself and record it under Key Decisions — do not leave placeholders like "TBD".
 
 The document must contain EXACTLY these sections, in this order:
 
@@ -22,7 +22,7 @@ The document must contain EXACTLY these sections, in this order:
 (each entry: the decision + a one-line rationale drawn from the debate, including any calls you made yourself just now)
 
 ## Open Risks
-(what the Critic flagged that remains unresolved or accepted-as-risk; if none, write "None outstanding" and one sentence on why)
+(every open or SETTLED-PROVISIONAL risk from the debate, each tagged with the severity bracket used during the debate — [CATASTROPHIC]/[SERIOUS]/[COSMETIC] — plus one line on why it's still open, still provisional, or accepted as-is; order [CATASTROPHIC] items first. If a catastrophic or serious item never got the one dedicated attack round its rating required, say so explicitly instead of presenting it as fully closed. If none, write "None outstanding" and one sentence on why.)
 
 RULES
 - Output ONLY the markdown document. No preamble, no postscript, no commentary, no code fences around the whole document.
