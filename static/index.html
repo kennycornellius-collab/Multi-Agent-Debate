@@ -10,11 +10,24 @@
   <header id="run-form">
     <h1>Multi-Agent Debate &amp; Build Pipeline</h1>
     <div class="form-row">
+      <label for="mode-select">Mode</label>
+      <select id="mode-select">
+        <option value="full">Full (debate + build)</option>
+        <option value="debate_only">Debate only (spec, no code)</option>
+        <option value="build_only">Build only (paste a spec)</option>
+      </select>
+    </div>
+    <div class="form-row" id="idea-row">
       <textarea id="idea" rows="2" placeholder="Describe a project idea, e.g. a CLI tool that renames photos by EXIF date"></textarea>
     </div>
-    <div class="form-row">
+    <div class="form-row" id="spec-row" hidden>
+      <textarea id="spec-text" rows="6" placeholder="Paste your own spec/schema here -- the build agents (Architect/Coder/Reviewer/Tester) use it as-is, no debate phase runs."></textarea>
+    </div>
+    <div class="form-row" id="rounds-row">
       <label for="rounds">Debate rounds</label>
       <input type="number" id="rounds" min="1" max="8" value="3">
+    </div>
+    <div class="form-row">
       <button id="run-btn" type="button">Run</button>
     </div>
     <div class="form-row" id="model-row">

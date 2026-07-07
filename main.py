@@ -16,7 +16,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
@@ -60,6 +60,8 @@ class RunState:
     bus: EventBus
     idea: str
     num_rounds: int
+    mode: Literal["full", "debate_only", "build_only"] = "full"
+    spec_text: str = ""  # build_only only: the user-supplied spec, written as agreed_spec.md
     phase: Optional[str] = None
     round: Optional[int] = None
     model: Optional[str] = None
@@ -78,7 +80,9 @@ runs: dict[str, RunState] = {}
 
 
 class RunRequest(BaseModel):
-    idea: str
+    # Required for mode="full"/"debate_only" (the debate loop's starting prompt);
+    # ignored for mode="build_only", which skips the debate loop entirely.
+    idea: str = ""
     num_rounds: int = config.DEFAULT_DEBATE_ROUNDS
     # Accepted for schema compatibility with SPEC.md's documented request body.
     # The build pipeline (agents/build.py) always runs its fixed four steps --
@@ -92,6 +96,16 @@ class RunRequest(BaseModel):
     # verified.
     model: Optional[str] = None
     effort: Optional[str] = None
+    # "full" (default): debate then build, unchanged original behavior.
+    # "debate_only": just the debate loop -- produces agreed_spec.md, no build agents run.
+    # "build_only": skips the debate loop; spec_text (below) is written straight to
+    # agreed_spec.md and the build pipeline runs against it -- lets a user who already
+    # has a spec/schema skip straight to code generation.
+    mode: Literal["full", "debate_only", "build_only"] = "full"
+    # Required for mode="build_only" (a user-authored spec, arbitrary markdown/text --
+    # not validated against the 6-section template; the Architect handles it as-is,
+    # same as any other agent input in this codebase). Ignored otherwise.
+    spec_text: str = ""
 
 
 class ModelCheckRequest(BaseModel):
@@ -122,18 +136,34 @@ async def _run_pipeline(state: RunState) -> None:
     # stale/incomplete value. fatal_error is only ever set synchronously, right here.
     fatal_error: Optional[str] = None
     try:
-        debate_result = await run_debate(
-            idea=state.idea,
-            num_rounds=state.num_rounds,
-            bus=state.bus,
-            run_id=state.run_id,
-            model=state.model,
-            effort=state.effort,
-        )
-        if debate_result.get("agreed_spec_path"):
+        if state.mode == "build_only":
+            # No debate call at all -- the user's own spec_text stands in for what the
+            # debate loop would have produced, written to the same path run_build()
+            # already expects to read (agents/build.py's own contract, unchanged).
+            out_dir = Path(config.OUTPUT_DIR) / state.run_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "agreed_spec.md").write_text(state.spec_text, encoding="utf-8")
             await run_build(run_id=state.run_id, bus=state.bus, model=state.model, effort=state.effort)
         else:
-            fatal_error = "Debate phase ended without an agreed spec; build phase skipped."
+            debate_result = await run_debate(
+                idea=state.idea,
+                num_rounds=state.num_rounds,
+                bus=state.bus,
+                run_id=state.run_id,
+                model=state.model,
+                effort=state.effort,
+            )
+            if state.mode == "full":
+                if debate_result.get("agreed_spec_path"):
+                    await run_build(
+                        run_id=state.run_id, bus=state.bus, model=state.model, effort=state.effort
+                    )
+                else:
+                    fatal_error = "Debate phase ended without an agreed spec; build phase skipped."
+            # mode == "debate_only": nothing further to do once run_debate returns --
+            # a debate that ended without an agreed spec is still a legitimate (if
+            # disappointing) end state for this mode, not a pipeline-level failure, so
+            # unlike "full" it does not set fatal_error here.
     except AgentError as e:
         fatal_error = str(e)
     except Exception as e:  # a bug here must not leave the run stuck as "running" forever
@@ -186,7 +216,11 @@ async def get_ui_config() -> dict:
 async def start_run(req: RunRequest) -> dict:
     if not preflight_ok:
         raise HTTPException(status_code=503, detail=preflight_message)
-    if not req.idea.strip():
+
+    if req.mode == "build_only":
+        if not req.spec_text.strip():
+            raise HTTPException(status_code=400, detail="spec_text must not be empty for mode=build_only")
+    elif not req.idea.strip():
         raise HTTPException(status_code=400, detail="idea must not be empty")
 
     model = req.model.strip() if req.model and req.model.strip() else None
@@ -200,7 +234,14 @@ async def start_run(req: RunRequest) -> dict:
     run_id = uuid.uuid4().hex[:8]
     bus = EventBus()
     state = RunState(
-        run_id=run_id, bus=bus, idea=req.idea, num_rounds=req.num_rounds, model=model, effort=effort
+        run_id=run_id,
+        bus=bus,
+        idea=req.idea,
+        num_rounds=req.num_rounds,
+        mode=req.mode,
+        spec_text=req.spec_text,
+        model=model,
+        effort=effort,
     )
     runs[run_id] = state
     state.task = asyncio.create_task(_run_pipeline(state))

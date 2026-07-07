@@ -7,7 +7,12 @@
   const SCROLL_BOTTOM_THRESHOLD = 40;
   const MODEL_CHECK_DEBOUNCE_MS = 400;
 
+  const modeSelect = document.getElementById("mode-select");
+  const ideaRow = document.getElementById("idea-row");
+  const specRow = document.getElementById("spec-row");
+  const roundsRow = document.getElementById("rounds-row");
   const ideaInput = document.getElementById("idea");
+  const specTextInput = document.getElementById("spec-text");
   const roundsInput = document.getElementById("rounds");
   const runBtn = document.getElementById("run-btn");
   const runErrorEl = document.getElementById("run-error");
@@ -17,6 +22,8 @@
   const effortLabelEl = document.getElementById("effort-label");
   const progressFill = document.getElementById("progress-fill");
   const progressLabel = document.getElementById("progress-label");
+  const debateFeedSection = document.getElementById("debate-feed");
+  const buildFeedSection = document.getElementById("build-feed");
   const debateFeedBody = document.querySelector("#debate-feed .feed-body");
   const buildFeedBody = document.querySelector("#build-feed .feed-body");
   const fileListEl = document.getElementById("file-list");
@@ -25,6 +32,7 @@
   const state = {
     runId: null,
     numRounds: 3,
+    mode: "full",
     eventSource: null,
     cards: new Map(), // key -> { el, body, status }
     selectedFile: null,
@@ -33,6 +41,23 @@
     effortChoices: [""],
     modelCheckSeq: 0, // guards against a stale check response overwriting a newer one
   };
+
+  // Progress-bar fraction ranges per mode: "full" keeps the original 0-0.5 debate /
+  // 0.5-1 build split; the single-phase modes get the whole 0-1 bar to themselves.
+  function progressSpan() {
+    if (state.mode === "debate_only") return { debateStart: 0, debateEnd: 1, buildStart: 1, buildEnd: 1 };
+    if (state.mode === "build_only") return { debateStart: 0, debateEnd: 0, buildStart: 0, buildEnd: 1 };
+    return { debateStart: 0, debateEnd: 0.5, buildStart: 0.5, buildEnd: 1 };
+  }
+
+  function applyModeVisibility(mode) {
+    const isBuildOnly = mode === "build_only";
+    ideaRow.hidden = isBuildOnly;
+    specRow.hidden = !isBuildOnly;
+    roundsRow.hidden = isBuildOnly;
+    debateFeedSection.hidden = isBuildOnly;
+    buildFeedSection.hidden = mode === "debate_only";
+  }
 
   function clamp(n, lo, hi) {
     return Math.max(lo, Math.min(hi, n));
@@ -53,8 +78,8 @@
     progressLabel.textContent = label;
   }
 
-  function persistRun(runId, numRounds) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ runId, numRounds }));
+  function persistRun(runId, numRounds, mode) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ runId, numRounds, mode }));
   }
 
   function clearPersistedRun() {
@@ -194,13 +219,14 @@
   }
 
   function updateProgress(ev) {
+    const { debateStart, debateEnd, buildStart, buildEnd } = progressSpan();
     if (ev.type === "run_done") {
       setProgress(1, ev.content ? "Finished with errors" : "Done");
       return;
     }
     if (ev.type === "phase_done") {
-      if (ev.phase === "debate") setProgress(0.5, "Build starting…");
-      else if (ev.phase === "build") setProgress(1, "Build complete");
+      if (ev.phase === "debate") setProgress(debateEnd, debateEnd >= 1 ? "Done" : "Build starting…");
+      else if (ev.phase === "build") setProgress(buildEnd, "Build complete");
       return;
     }
     if (ev.type !== "agent_start") return;
@@ -208,13 +234,13 @@
       const n = state.numRounds || 3;
       const within = ev.round == null ? 1 : (ev.round - 1) / n;
       setProgress(
-        0.5 * Math.min(within, 1),
+        debateStart + (debateEnd - debateStart) * Math.min(within, 1),
         ev.round == null ? `Debate — final synthesis (${ev.agent})` : `Debate — round ${ev.round}/${n}: ${ev.agent}`
       );
     } else if (ev.phase === "build") {
       const idx = BUILD_ORDER.indexOf(ev.agent);
       const within = idx === -1 ? 0 : idx / BUILD_ORDER.length;
-      setProgress(0.5 + 0.5 * within, `Build — ${ev.agent}`);
+      setProgress(buildStart + (buildEnd - buildStart) * within, `Build — ${ev.agent}`);
     }
   }
 
@@ -320,10 +346,21 @@
 
   async function startRun() {
     hideError();
-    const idea = ideaInput.value.trim();
-    if (!idea) {
-      showError("Please enter a project idea.");
-      return;
+    const mode = modeSelect.value;
+    let idea = "";
+    let specText = "";
+    if (mode === "build_only") {
+      specText = specTextInput.value.trim();
+      if (!specText) {
+        showError("Please paste a spec for build-only mode.");
+        return;
+      }
+    } else {
+      idea = ideaInput.value.trim();
+      if (!idea) {
+        showError("Please enter a project idea.");
+        return;
+      }
     }
     const numRounds = clamp(parseInt(roundsInput.value, 10) || 3, 1, 8);
     const model = modelSelect.value || null;
@@ -334,7 +371,15 @@
       const res = await fetch("/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ idea, num_rounds: numRounds, agents: [], model, effort }),
+        body: JSON.stringify({
+          idea,
+          spec_text: specText,
+          num_rounds: numRounds,
+          agents: [],
+          model,
+          effort,
+          mode,
+        }),
       });
       if (!res.ok) {
         showError((await safeDetail(res)) || `Request failed (${res.status})`);
@@ -342,9 +387,11 @@
         return;
       }
       const data = await res.json();
+      state.mode = mode;
+      applyModeVisibility(mode);
       resetFeeds();
       state.numRounds = numRounds;
-      persistRun(data.run_id, numRounds);
+      persistRun(data.run_id, numRounds, mode);
       connect(data.run_id);
     } catch (err) {
       showError(`Network error starting run: ${err.message}`);
@@ -421,7 +468,7 @@
       clearPersistedRun();
       return;
     }
-    const { runId, numRounds } = saved || {};
+    const { runId, numRounds, mode } = saved || {};
     if (!runId) {
       clearPersistedRun();
       return;
@@ -441,6 +488,9 @@
 
     state.runId = runId;
     state.numRounds = numRounds || 3;
+    state.mode = mode || "full";
+    modeSelect.value = state.mode;
+    applyModeVisibility(state.mode);
     runBtn.disabled = !!status.running;
     connect(runId);
     if (status.running) {
@@ -456,7 +506,9 @@
   runBtn.addEventListener("click", startRun);
   modelSelect.addEventListener("change", scheduleModelCheck);
   effortSlider.addEventListener("input", updateEffortLabel);
+  modeSelect.addEventListener("change", () => applyModeVisibility(modeSelect.value));
   window.addEventListener("DOMContentLoaded", () => {
+    applyModeVisibility(modeSelect.value);
     loadUiConfig();
     tryRecoverRun();
   });

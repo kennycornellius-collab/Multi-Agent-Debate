@@ -78,7 +78,15 @@ h2 { font-size: 1rem; margin: 0 0 0.5rem; color: var(--muted); }
   margin-bottom: 0.5rem;
 }
 
-#idea {
+/* .form-row's own `display: flex` above has the same specificity as the browser's
+   default `[hidden] { display: none }` rule, and author styles win that tie -- so a
+   plain `hidden` attribute on a .form-row (e.g. #spec-row/#idea-row/#rounds-row
+   toggled by app.js's applyModeVisibility) would silently stay visible without this
+   override. */
+.form-row[hidden] { display: none; }
+
+#idea,
+#spec-text {
   flex: 1;
   font: inherit;
   padding: 0.5rem;
@@ -87,6 +95,17 @@ h2 { font-size: 1rem; margin: 0 0 0.5rem; color: var(--muted); }
   background: var(--panel-bg);
   color: var(--fg);
   resize: vertical;
+}
+
+#spec-text { font-family: ui-monospace, Consolas, monospace; font-size: 0.85rem; }
+
+#mode-select {
+  font: inherit;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  color: var(--fg);
 }
 
 #rounds {
