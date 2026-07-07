@@ -60,3 +60,17 @@ BUILD_AGENTS = {
     "Reviewer": ("build/reviewer.txt", "builder", REVIEWER_TIMEOUT),
     "Tester": ("build/tester.txt", "builder", TESTER_TIMEOUT),
 }
+
+# Codebase Analysis Mode (SPEC.md addon), Stage 7: sandbox preparation.
+# Directories/files excluded when copying the user's real codebase into the
+# sandbox -- matched by name at every tree level via shutil.ignore_patterns.
+SANDBOX_IGNORE = [
+    ".git", "node_modules", "__pycache__", ".venv", "venv",
+    "dist", "build", ".next", "target", ".mypy_cache", ".pytest_cache",
+]
+
+# Identity for the throwaway baseline commit made *inside* the sandbox copy --
+# never the user's own identity, and never written to their global git config.
+# Passed inline via `git -c ...` for that single commit only; see agents/sandbox.py.
+SANDBOX_GIT_NAME = "debate-pipeline"
+SANDBOX_GIT_EMAIL = "debate-pipeline@localhost"
