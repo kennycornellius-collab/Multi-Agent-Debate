@@ -74,3 +74,11 @@ SANDBOX_IGNORE = [
 # Passed inline via `git -c ...` for that single commit only; see agents/sandbox.py.
 SANDBOX_GIT_NAME = "debate-pipeline"
 SANDBOX_GIT_EMAIL = "debate-pipeline@localhost"
+
+# Codebase Analysis Mode, Stage 8: the Recon agent. read_only mode grants Read/Glob/
+# Grep only (agents/runner.py) -- structural enforcement, not just prompt discipline.
+RECON_TIMEOUT = 300   # read-only exploration, not a write-heavy session
+RECON_MAX_TURNS = 20  # lower than BUILD_MAX_TURNS -- no edits to make, just look
+RECON_MODEL = None    # None = CLI default; independently tunable from DEBATE_MODEL/BUILD_MODEL
+
+RECON_AGENT = ("codebase/recon.txt", "read_only", RECON_TIMEOUT)  # (prompt file, mode, timeout)

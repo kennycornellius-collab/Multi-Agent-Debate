@@ -37,7 +37,7 @@ def _build_args(
     *,
     prompt_path: Path,
     instruction: str,
-    mode: Literal["text_only", "builder"],
+    mode: Literal["text_only", "builder", "read_only"],
     include_budget_flag: bool,
     model: Optional[str] = None,
     effort: Optional[str] = None,
@@ -64,6 +64,13 @@ def _build_args(
             str(config.BUILD_MAX_TURNS),
         ]
         default_model = config.BUILD_MODEL
+    elif mode == "read_only":
+        # Structural enforcement, not just prompt discipline: Read/Glob/Grep only, no
+        # Edit/Write/Bash -- confirmed against the real CLI that this needs no
+        # --permission-mode flag (there's nothing to grant permission for) and doesn't
+        # hang waiting on a prompt it can never receive non-interactively.
+        args += ["--tools", "Read,Glob,Grep", "--max-turns", str(config.RECON_MAX_TURNS)]
+        default_model = config.RECON_MODEL
     else:
         raise AgentError(f"unknown mode: {mode!r}")
 
@@ -127,7 +134,7 @@ async def run_agent_streaming(
     system_prompt_file: str,
     stdin_text: str,
     instruction: str,
-    mode: Literal["text_only", "builder"],
+    mode: Literal["text_only", "builder", "read_only"],
     agent: Optional[str] = None,
     phase: Optional[str] = None,
     round: Optional[int] = None,
@@ -142,18 +149,23 @@ async def run_agent_streaming(
     full text and reported cost. Raises AgentError on nonzero exit or timeout.
 
     `model`/`effort` are optional per-call overrides (e.g. from the browser UI); when
-    omitted, `_build_args` falls back to config.py's per-mode DEBATE_MODEL/BUILD_MODEL
-    default, unchanged from before these params existed.
+    omitted, `_build_args` falls back to config.py's per-mode DEBATE_MODEL/BUILD_MODEL/
+    RECON_MODEL default, unchanged from before these params existed.
 
     Guarded --max-budget-usd: if the CLI rejects the flag as unrecognized (older/newer
     builds), retry once without it -- transparently, before any output has been yielded.
     """
-    if mode == "builder" and not cwd:
-        raise AgentError("mode='builder' requires cwd")
+    if mode in ("builder", "read_only") and not cwd:
+        raise AgentError(f"mode={mode!r} requires cwd")
 
     prompt_path = _resolve_prompt_file(system_prompt_file)
     if timeout is None:
-        timeout = config.DEBATE_TIMEOUT if mode == "text_only" else config.CODER_TIMEOUT
+        if mode == "text_only":
+            timeout = config.DEBATE_TIMEOUT
+        elif mode == "read_only":
+            timeout = config.RECON_TIMEOUT
+        else:
+            timeout = config.CODER_TIMEOUT
 
     common_kwargs = dict(
         prompt_path=prompt_path,
@@ -192,7 +204,7 @@ async def _run_once(
     prompt_path: Path,
     stdin_text: str,
     instruction: str,
-    mode: Literal["text_only", "builder"],
+    mode: Literal["text_only", "builder", "read_only"],
     agent: Optional[str],
     phase: Optional[str],
     round: Optional[int],
