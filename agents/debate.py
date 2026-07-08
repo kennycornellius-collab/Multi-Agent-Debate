@@ -14,7 +14,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import config
 from agents.events import AgentEvent, EventBus
@@ -83,6 +83,8 @@ async def _run_turn(
     instruction: str,
     phase: str,
     round: Optional[int],
+    mode: Literal["text_only", "read_only"] = "text_only",
+    cwd: Optional[str] = None,
     timeout: Optional[int] = None,
     model: Optional[str] = None,
     effort: Optional[str] = None,
@@ -90,6 +92,10 @@ async def _run_turn(
     """Run one agent turn, streaming deltas onto the bus. Retries once on AgentError;
     on a second failure, emits an `error` event and returns (None, 0.0, False) so the
     caller can add a system note and keep the debate going.
+
+    `mode`/`cwd` default to a pure text_only turn with no cwd (every debate agent,
+    always, before Codebase Analysis Mode existed). Codebase mode's Critic turn is the
+    only caller that passes mode="read_only"/cwd=<sandbox> -- see run_debate().
 
     The third element of the return tuple is `truncated`: True if the CLI hit its
     turn limit but had already produced usable output (see agents/runner.py) -- mirrors
@@ -105,7 +111,8 @@ async def _run_turn(
                 system_prompt_file=system_prompt_file,
                 stdin_text=stdin_text,
                 instruction=instruction,
-                mode="text_only",
+                mode=mode,
+                cwd=cwd,
                 agent=agent,
                 phase=phase,
                 round=round,
@@ -141,13 +148,23 @@ async def run_debate(
     output_dir: Optional[str] = None,
     model: Optional[str] = None,
     effort: Optional[str] = None,
+    sandbox_dir: Optional[str] = None,
 ) -> dict:
     """Run the full debate loop + final synthesis. Returns a summary dict; always writes
     debate_log.json, and writes agreed_spec.md only if the final synthesis succeeded.
 
     `model`/`effort` are optional per-run overrides (e.g. from the browser UI) applied to
     every agent call in this run, debate and final synthesis alike; omitted, they fall
-    back to config.py's DEBATE_MODEL default via agents/runner.py."""
+    back to config.py's DEBATE_MODEL default via agents/runner.py.
+
+    `sandbox_dir` is Codebase Analysis Mode's hook (SPEC.md Stage 9): when set, it's an
+    already-prepared sandbox (agents/sandbox.py) whose presence *is* codebase mode --
+    no separate bool needed. The only thing it changes: Critic's turn runs
+    mode="read_only" with cwd=sandbox_dir instead of text_only, so it can verify claims
+    (especially Recon's) against the real files instead of only arguing from the
+    transcript. Strategist and Refiner are unaffected. The codebase context itself is
+    expected to already be folded into `idea` by the caller (e.g. Recon's digest) --
+    run_debate() doesn't know or care where `idea` came from."""
     num_rounds = max(1, min(num_rounds, config.MAX_DEBATE_ROUNDS))
     out_dir = Path(output_dir) if output_dir else Path(config.OUTPUT_DIR) / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -164,6 +181,22 @@ async def run_debate(
                 f"You are speaking in round {r} of {num_rounds}. Read the transcript on stdin "
                 "and reply now, in character, following your role and output-format rules."
             )
+            agent_mode: Literal["text_only", "read_only"] = "text_only"
+            agent_cwd: Optional[str] = None
+            agent_timeout = config.DEBATE_TIMEOUT
+            if sandbox_dir and name == "Critic":
+                # Only Critic gets tool access in codebase mode -- giving all three
+                # agents read access would triple the tool-call cost per round for a
+                # benefit only Critic's skeptical role actually needs (SPEC.md).
+                agent_mode = "read_only"
+                agent_cwd = sandbox_dir
+                agent_timeout = config.RECON_TIMEOUT  # real file exploration, not a plain reply
+                instruction += (
+                    "\n\nYou have read-only access to the actual codebase in your working "
+                    "directory. Verify claims in the transcript -- especially Recon's -- "
+                    "against the real files before critiquing. Cite file path + line for "
+                    "anything you confirm or refute."
+                )
             text, cost, truncated = await _run_turn(
                 bus,
                 agent=name,
@@ -172,7 +205,9 @@ async def run_debate(
                 instruction=instruction,
                 phase="debate",
                 round=r,
-                timeout=config.DEBATE_TIMEOUT,
+                mode=agent_mode,
+                cwd=agent_cwd,
+                timeout=agent_timeout,
                 model=model,
                 effort=effort,
             )
@@ -188,6 +223,16 @@ async def run_debate(
 
     final_instruction_path = Path(config.PROMPTS_DIR) / config.REFINER_FINAL_INSTRUCTION
     final_instruction = final_instruction_path.read_text(encoding="utf-8")
+    if sandbox_dir:
+        # One conditional line (SPEC.md Stage 9), appended in code rather than a second
+        # near-duplicate prompt file -- same "force_full" precedent as the transcript
+        # trick above: one template, one branch condition.
+        final_instruction += (
+            "\n\nNote: this is Codebase Analysis Mode -- the debate concerns changes to an "
+            "existing codebase (see the codebase context folded into the project idea above). "
+            "The File Plan section should describe edits to existing paths (and any genuinely "
+            "new files), not a fresh project tree."
+        )
     final_stdin = render_transcript(idea, history, current_round=1, summary=summary)  # force full
 
     final_text, final_cost, final_truncated = await _run_turn(
@@ -245,7 +290,7 @@ async def run_debate(
     }
 
 
-async def _headless_main(idea: str, num_rounds: int) -> None:
+async def _headless_main(idea: str, num_rounds: int, sandbox_dir: Optional[str] = None) -> None:
     run_id = uuid.uuid4().hex[:8]
     bus = EventBus()
 
@@ -265,7 +310,9 @@ async def _headless_main(idea: str, num_rounds: int) -> None:
 
     consumer_task = asyncio.create_task(_consume())
     try:
-        result = await run_debate(idea=idea, num_rounds=num_rounds, bus=bus, run_id=run_id)
+        result = await run_debate(
+            idea=idea, num_rounds=num_rounds, bus=bus, run_id=run_id, sandbox_dir=sandbox_dir
+        )
     finally:
         bus.close()
     await consumer_task
@@ -283,6 +330,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Phase 1 debate headlessly.")
     parser.add_argument("idea", help="the project idea to debate")
     parser.add_argument("--rounds", type=int, default=config.DEFAULT_DEBATE_ROUNDS)
+    parser.add_argument(
+        "--sandbox",
+        default=None,
+        help="path to an already-prepared sandbox (agents/sandbox.py) -- enables Codebase "
+        "Analysis Mode: Critic gets read-only file access instead of pure text_only",
+    )
     return parser.parse_args(argv)
 
 
@@ -294,4 +347,4 @@ if __name__ == "__main__":
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     args = _parse_args(sys.argv[1:])
-    asyncio.run(_headless_main(args.idea, args.rounds))
+    asyncio.run(_headless_main(args.idea, args.rounds, sandbox_dir=args.sandbox))
