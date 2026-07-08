@@ -15,7 +15,12 @@
         <option value="full">Full (debate + build)</option>
         <option value="debate_only">Debate only (spec, no code)</option>
         <option value="build_only">Build only (paste a spec)</option>
+        <option value="codebase">Codebase (patch an existing project)</option>
       </select>
+    </div>
+    <div class="form-row" id="target-path-row" hidden>
+      <label for="target-path">Target path</label>
+      <input type="text" id="target-path" placeholder="C:\path\to\existing\project -- read-only, never written to">
     </div>
     <div class="form-row" id="idea-row">
       <textarea id="idea" rows="2" placeholder="Describe a project idea, e.g. a CLI tool that renames photos by EXIF date"></textarea>
@@ -50,7 +55,7 @@
 
   <main id="feeds">
     <section id="debate-feed" class="feed">
-      <h2>Debate</h2>
+      <h2 id="debate-feed-title">Debate</h2>
       <div class="feed-body"></div>
     </section>
     <section id="build-feed" class="feed">

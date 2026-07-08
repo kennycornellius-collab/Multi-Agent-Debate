@@ -17,6 +17,7 @@
   --coder: #e08a1f;
   --reviewer: #1f9e9e;
   --tester: #c9a015;
+  --recon: #6b7280;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -86,7 +87,8 @@ h2 { font-size: 1rem; margin: 0 0 0.5rem; color: var(--muted); }
 .form-row[hidden] { display: none; }
 
 #idea,
-#spec-text {
+#spec-text,
+#target-path {
   flex: 1;
   font: inherit;
   padding: 0.5rem;
@@ -263,6 +265,7 @@ h2 { font-size: 1rem; margin: 0 0 0.5rem; color: var(--muted); }
 .card.agent-coder { border-left-color: var(--coder); }
 .card.agent-reviewer { border-left-color: var(--reviewer); }
 .card.agent-tester { border-left-color: var(--tester); }
+.card.agent-recon { border-left-color: var(--recon); }
 
 .card.agent-strategist .card-header { color: var(--strategist); }
 .card.agent-critic .card-header { color: var(--critic); }
@@ -271,6 +274,7 @@ h2 { font-size: 1rem; margin: 0 0 0.5rem; color: var(--muted); }
 .card.agent-coder .card-header { color: var(--coder); }
 .card.agent-reviewer .card-header { color: var(--reviewer); }
 .card.agent-tester .card-header { color: var(--tester); }
+.card.agent-recon .card-header { color: var(--recon); }
 
 .card.error {
   background: var(--error-bg);

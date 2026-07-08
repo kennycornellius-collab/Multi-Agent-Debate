@@ -27,7 +27,9 @@ import config
 from agents.build import run_build
 from agents.debate import run_debate
 from agents.events import AgentEvent, EventBus
+from agents.recon import run_recon
 from agents.runner import AgentError, run_agent
+from agents.sandbox import prepare_sandbox
 from check_cli import run_preflight
 
 logger = logging.getLogger(__name__)
@@ -60,8 +62,9 @@ class RunState:
     bus: EventBus
     idea: str
     num_rounds: int
-    mode: Literal["full", "debate_only", "build_only"] = "full"
+    mode: Literal["full", "debate_only", "build_only", "codebase"] = "full"
     spec_text: str = ""  # build_only only: the user-supplied spec, written as agreed_spec.md
+    target_path: str = ""  # codebase only: path to the existing codebase to patch
     phase: Optional[str] = None
     round: Optional[int] = None
     model: Optional[str] = None
@@ -81,7 +84,9 @@ runs: dict[str, RunState] = {}
 
 class RunRequest(BaseModel):
     # Required for mode="full"/"debate_only" (the debate loop's starting prompt);
-    # ignored for mode="build_only", which skips the debate loop entirely.
+    # ignored for mode="build_only", which skips the debate loop entirely. Also required
+    # for mode="codebase", where it's reused with a new meaning: the bug/feature
+    # description Recon investigates (SPEC.md's addon, same field, new meaning).
     idea: str = ""
     num_rounds: int = config.DEFAULT_DEBATE_ROUNDS
     # Accepted for schema compatibility with SPEC.md's documented request body.
@@ -101,11 +106,20 @@ class RunRequest(BaseModel):
     # "build_only": skips the debate loop; spec_text (below) is written straight to
     # agreed_spec.md and the build pipeline runs against it -- lets a user who already
     # has a spec/schema skip straight to code generation.
-    mode: Literal["full", "debate_only", "build_only"] = "full"
+    # "codebase": Codebase Analysis Mode (SPEC.md addon) -- sandboxes target_path (below),
+    # runs Recon against it, folds Recon's digest into `idea`, runs the debate with
+    # Critic's read-only sandbox access, then patches the sandbox in place instead of
+    # scaffolding a fresh tree. Produces patch.diff; target_path itself is never written to.
+    mode: Literal["full", "debate_only", "build_only", "codebase"] = "full"
     # Required for mode="build_only" (a user-authored spec, arbitrary markdown/text --
     # not validated against the 6-section template; the Architect handles it as-is,
     # same as any other agent input in this codebase). Ignored otherwise.
     spec_text: str = ""
+    # Required for mode="codebase": path to the existing codebase to analyze/patch. Does
+    # not need to be a git repo, need never have been committed, and needs no relation to
+    # GitHub (SPEC.md). Only ever read once by the sandbox-prep step; never written to.
+    # Ignored otherwise.
+    target_path: str = ""
 
 
 class ModelCheckRequest(BaseModel):
@@ -144,6 +158,59 @@ async def _run_pipeline(state: RunState) -> None:
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "agreed_spec.md").write_text(state.spec_text, encoding="utf-8")
             await run_build(run_id=state.run_id, bus=state.bus, model=state.model, effort=state.effort)
+        elif state.mode == "codebase":
+            # Codebase Analysis Mode (SPEC.md addon): chain Stage 7 (sandbox) -> Stage 8
+            # (Recon) -> Stage 9 (debate with Critic's read-only sandbox access) -> Stage
+            # 10 (patch-build). Every step shares this run's bus, same as full/debate_only/
+            # build_only above -- one live feed regardless of mode.
+            sandbox_result = await prepare_sandbox(
+                target_path=state.target_path, run_id=state.run_id, bus=state.bus
+            )
+            if not sandbox_result["ok"]:
+                fatal_error = (
+                    f"Sandbox preparation failed ({sandbox_result.get('reason', 'unknown')}); "
+                    "the run stopped before any agent call was made."
+                )
+            else:
+                sandbox_dir = sandbox_result["build_dir"]
+                diff_available = sandbox_result["diff_available"]
+                # run_recon() has no output_dir default of its own (unlike run_debate/
+                # run_build) -- it only writes codebase_context.md when explicitly given
+                # one, so it must be passed here for the file to show up in the UI's
+                # output panel.
+                out_dir = Path(config.OUTPUT_DIR) / state.run_id
+                recon_result = await run_recon(
+                    sandbox_dir=sandbox_dir,
+                    description=state.idea,
+                    bus=state.bus,
+                    output_dir=str(out_dir),
+                )
+                # run_recon() never raises and always returns a usable context_text (a
+                # graceful fallback note on failure) -- no "did Recon succeed" branching
+                # needed here, per its own contract (agents/recon.py).
+                blended_idea = (
+                    f"{state.idea}\n\n=== CODEBASE CONTEXT (Recon) ===\n{recon_result['context_text']}"
+                )
+                debate_result = await run_debate(
+                    idea=blended_idea,
+                    num_rounds=state.num_rounds,
+                    bus=state.bus,
+                    run_id=state.run_id,
+                    model=state.model,
+                    effort=state.effort,
+                    sandbox_dir=sandbox_dir,
+                )
+                if debate_result.get("agreed_spec_path"):
+                    await run_build(
+                        run_id=state.run_id,
+                        bus=state.bus,
+                        model=state.model,
+                        effort=state.effort,
+                        target_mode=True,
+                        diff_available=diff_available,
+                    )
+                else:
+                    fatal_error = "Debate phase ended without an agreed spec; build phase skipped."
         else:
             debate_result = await run_debate(
                 idea=state.idea,
@@ -220,8 +287,11 @@ async def start_run(req: RunRequest) -> dict:
     if req.mode == "build_only":
         if not req.spec_text.strip():
             raise HTTPException(status_code=400, detail="spec_text must not be empty for mode=build_only")
-    elif not req.idea.strip():
-        raise HTTPException(status_code=400, detail="idea must not be empty")
+    else:
+        if not req.idea.strip():
+            raise HTTPException(status_code=400, detail="idea must not be empty")
+        if req.mode == "codebase" and not req.target_path.strip():
+            raise HTTPException(status_code=400, detail="target_path must not be empty for mode=codebase")
 
     model = req.model.strip() if req.model and req.model.strip() else None
     effort = req.effort.strip() if req.effort and req.effort.strip() else None
@@ -240,6 +310,7 @@ async def start_run(req: RunRequest) -> dict:
         num_rounds=req.num_rounds,
         mode=req.mode,
         spec_text=req.spec_text,
+        target_path=req.target_path,
         model=model,
         effort=effort,
     )
@@ -315,8 +386,13 @@ async def list_output(run_id: str) -> dict:
     run_dir = (OUTPUT_ROOT / run_id).resolve()
     if not run_dir.is_dir():
         return {"run_id": run_id, "files": []}
+    # Codebase mode's sandbox (agents/sandbox.py) carries its own throwaway `.git/` for
+    # diffing -- internal plumbing, not a user-facing output, and dumping its dozens of
+    # hook/object files into the panel alongside patch.diff/build/*.py would be noise.
     files = sorted(
-        str(p.relative_to(run_dir)).replace("\\", "/") for p in run_dir.rglob("*") if p.is_file()
+        str(rel).replace("\\", "/")
+        for p in run_dir.rglob("*")
+        if p.is_file() and ".git" not in (rel := p.relative_to(run_dir)).parts
     )
     return {"run_id": run_id, "files": files}
 

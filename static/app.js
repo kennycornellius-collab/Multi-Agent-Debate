@@ -11,9 +11,12 @@
   const ideaRow = document.getElementById("idea-row");
   const specRow = document.getElementById("spec-row");
   const roundsRow = document.getElementById("rounds-row");
+  const targetPathRow = document.getElementById("target-path-row");
   const ideaInput = document.getElementById("idea");
   const specTextInput = document.getElementById("spec-text");
+  const targetPathInput = document.getElementById("target-path");
   const roundsInput = document.getElementById("rounds");
+  const debateFeedTitle = document.getElementById("debate-feed-title");
   const runBtn = document.getElementById("run-btn");
   const runErrorEl = document.getElementById("run-error");
   const modelSelect = document.getElementById("model-select");
@@ -52,11 +55,20 @@
 
   function applyModeVisibility(mode) {
     const isBuildOnly = mode === "build_only";
+    const isCodebase = mode === "codebase";
     ideaRow.hidden = isBuildOnly;
     specRow.hidden = !isBuildOnly;
     roundsRow.hidden = isBuildOnly;
+    targetPathRow.hidden = !isCodebase;
     debateFeedSection.hidden = isBuildOnly;
     buildFeedSection.hidden = mode === "debate_only";
+    ideaInput.placeholder = isCodebase
+      ? "Describe the bug or feature to investigate, e.g. add(2, 3) returns -1 instead of 5"
+      : "Describe a project idea, e.g. a CLI tool that renames photos by EXIF date";
+    // Sandbox/recon events (codebase mode's pre-debate steps) land in this panel too --
+    // see feedBodyFor() -- so its heading should reflect that instead of implying only
+    // debate cards ever show up there.
+    debateFeedTitle.textContent = isCodebase ? "Investigation & Debate" : "Debate";
   }
 
   function clamp(n, lo, hi) {
@@ -163,7 +175,10 @@
   }
 
   function feedBodyFor(phase) {
-    return phase === "debate" ? debateFeedBody : buildFeedBody;
+    // "build" is the only phase that belongs in the build feed; everything else --
+    // "debate", plus codebase mode's pre-debate "sandbox"/"recon" phases -- reads
+    // naturally as part of "getting to and having the debate", so it shares that panel.
+    return phase === "build" ? buildFeedBody : debateFeedBody;
   }
 
   function cardKey(ev) {
@@ -230,7 +245,11 @@
       return;
     }
     if (ev.type !== "agent_start") return;
-    if (ev.phase === "debate") {
+    if (ev.phase === "sandbox") {
+      setProgress(0, "Preparing sandbox…");
+    } else if (ev.phase === "recon") {
+      setProgress(0.02, "Investigating codebase (Recon)…");
+    } else if (ev.phase === "debate") {
       const n = state.numRounds || 3;
       const within = ev.round == null ? 1 : (ev.round - 1) / n;
       setProgress(
@@ -349,6 +368,7 @@
     const mode = modeSelect.value;
     let idea = "";
     let specText = "";
+    let targetPath = "";
     if (mode === "build_only") {
       specText = specTextInput.value.trim();
       if (!specText) {
@@ -358,8 +378,15 @@
     } else {
       idea = ideaInput.value.trim();
       if (!idea) {
-        showError("Please enter a project idea.");
+        showError(mode === "codebase" ? "Please describe the bug or feature to investigate." : "Please enter a project idea.");
         return;
+      }
+      if (mode === "codebase") {
+        targetPath = targetPathInput.value.trim();
+        if (!targetPath) {
+          showError("Please enter the path to the existing codebase.");
+          return;
+        }
       }
     }
     const numRounds = clamp(parseInt(roundsInput.value, 10) || 3, 1, 8);
@@ -374,6 +401,7 @@
         body: JSON.stringify({
           idea,
           spec_text: specText,
+          target_path: targetPath,
           num_rounds: numRounds,
           agents: [],
           model,
