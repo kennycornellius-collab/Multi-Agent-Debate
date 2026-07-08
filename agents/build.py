@@ -106,6 +106,12 @@ async def _run_step(
             ):
                 if event.type == "delta":
                     bus.emit(event)
+                elif event.type in ("paused", "resumed"):
+                    # Usage-Limit Resilience addon: run_agent_streaming is waiting out a
+                    # usage-limit exhaustion internally and will retry the same call once
+                    # it's over -- forward these straight through so the UI can show a
+                    # paused state instead of the step looking silently stuck.
+                    bus.emit(event)
                 elif event.type == "result":
                     full_text = event.content
                     cost_usd = event.cost_usd or 0.0

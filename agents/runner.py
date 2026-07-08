@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import AsyncIterator, Literal, Optional
 
@@ -24,6 +26,19 @@ STDERR_TAIL_CHARS = 500
 
 class AgentError(Exception):
     """Raised when an agent invocation fails (nonzero exit, timeout, bad setup)."""
+
+
+class RateLimitError(AgentError):
+    """Raised instead of a plain AgentError (Usage-Limit Resilience addon) when a failure
+    looks like a subscription usage-limit exhaustion, or (is_transient_429=True) a
+    transient API-tier 429 -- as opposed to a genuine model/CLI error, which still raises
+    a plain AgentError unchanged. Caught internally by run_agent_streaming's wait/resume
+    loop; only escapes to a caller that passed wait_on_rate_limit=False."""
+
+    def __init__(self, message: str, *, retry_at: Optional[datetime], is_transient_429: bool):
+        super().__init__(message)
+        self.retry_at = retry_at
+        self.is_transient_429 = is_transient_429
 
 
 def _resolve_prompt_file(system_prompt_file: str) -> Path:
@@ -95,6 +110,90 @@ def _looks_like_unknown_flag_error(stderr: str) -> bool:
     return "--max-budget-usd" in stderr or "unknown option" in lowered or "unrecognized" in lowered
 
 
+_WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+# Only the CLI's message *wording* is documented (e.g. "resets 3:45pm" / "resets Mon
+# 12:00am"), not a machine-readable reset field -- see config.py's RATE_LIMIT_MARKERS
+# comment. Deliberately tolerant (optional weekday, single regex) rather than a strict
+# format, since this is a best-effort parse with a safe fallback (config.RATE_LIMIT_POLL_
+# SECONDS) when it doesn't match.
+_RESET_TIME_RE = re.compile(
+    r"resets?\s+(?:(mon|tue|wed|thu|fri|sat|sun)\w*\s+)?(\d{1,2}):(\d{2})\s*([ap]m)",
+    re.IGNORECASE,
+)
+
+
+def _parse_reset_time(text: str, *, now: Optional[datetime] = None) -> Optional[datetime]:
+    """Best-effort parse of a "... resets <time>" / "... resets <Weekday> <time>" fragment
+    into a concrete datetime to wait until. Returns None if nothing recognizable is found --
+    callers fall back to a fixed poll interval instead of guessing."""
+    match = _RESET_TIME_RE.search(text)
+    if not match:
+        return None
+
+    weekday_str, hour_str, minute_str, meridiem = match.groups()
+    now = now or datetime.now()
+
+    hour = int(hour_str) % 12
+    if meridiem.lower() == "pm":
+        hour += 12
+    minute = int(minute_str)
+
+    if weekday_str:
+        target_weekday = _WEEKDAYS.index(weekday_str.lower()[:3])
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        days_ahead = (target_weekday - now.weekday()) % 7
+        candidate += timedelta(days=days_ahead)
+        if days_ahead == 0 and candidate <= now:
+            candidate += timedelta(days=7)
+        return candidate
+
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _detect_rate_limit(
+    *, result_text: Optional[str], stderr_text: str, rate_limit_payload: Optional[dict]
+) -> Optional[RateLimitError]:
+    """Scan every text source a usage-limit message could plausibly arrive in -- the
+    exact NDJSON envelope for this isn't documented, so this checks the terminal result
+    event's text, stderr, and the (previously discarded) rate_limit_event payload all at
+    once -- and, on a match against config.RATE_LIMIT_MARKERS, return a RateLimitError
+    describing what was found instead of a plain AgentError. Returns None when nothing
+    matches, leaving the caller's ordinary AgentError path unchanged.
+
+    Logs the raw matched text loudly on a hit: the marker list is a best guess at the
+    CLI's real wording (confirmed docs only, never triggered against a genuinely
+    exhausted account -- see progress.md), so if the wording ever drifts, this is the
+    trail that makes it diagnosable instead of silently missed."""
+    candidates = [result_text or "", stderr_text or ""]
+    if rate_limit_payload:
+        candidates.append(json.dumps(rate_limit_payload))
+    combined = "\n".join(c for c in candidates if c)
+    lowered = combined.lower()
+
+    for marker in config.RATE_LIMIT_MARKERS:
+        if marker in lowered:
+            retry_at = _parse_reset_time(combined)
+            print(
+                f"[runner] detected usage-limit marker {marker!r} in CLI output "
+                f"(retry_at={retry_at}): {combined[:300]!r}",
+                file=sys.stderr,
+            )
+            return RateLimitError(combined.strip()[-500:], retry_at=retry_at, is_transient_429=False)
+
+    if config.RATE_LIMIT_TRANSIENT_MARKER in lowered:
+        print(
+            f"[runner] detected transient rate-limit marker in CLI output: {combined[:300]!r}",
+            file=sys.stderr,
+        )
+        return RateLimitError(combined.strip()[-500:], retry_at=None, is_transient_429=True)
+
+    return None
+
+
 async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
     """Kill the CLI and any children it spawned. proc.kill() alone can leave
     child processes running on Windows, so shell out to taskkill there."""
@@ -129,6 +228,72 @@ async def _spawn(args: list[str], *, cwd: Optional[str]) -> asyncio.subprocess.P
     )
 
 
+async def _run_attempt(**common_kwargs) -> AsyncIterator[AgentEvent]:
+    """One full call attempt: the existing --max-budget-usd guarded-retry-once, with no
+    rate-limit handling of its own -- that lives one level up in run_agent_streaming,
+    which is the only place that needs to catch RateLimitError and turn it into a wait
+    instead of letting it surface as an ordinary AgentError."""
+    gen = _run_once(**common_kwargs, include_budget_flag=True)
+    try:
+        first_event = await gen.__anext__()
+    except StopAsyncIteration:
+        return
+    except AgentError as e:
+        if not isinstance(e, RateLimitError) and _looks_like_unknown_flag_error(str(e)):
+            print("[runner] --max-budget-usd rejected by this CLI build; retrying without it", file=sys.stderr)
+            gen = _run_once(**common_kwargs, include_budget_flag=False)
+            first_event = await gen.__anext__()
+        else:
+            raise
+
+    yield first_event
+    async for event in gen:
+        yield event
+
+
+async def _wait_for_quota(
+    err: RateLimitError, *, agent: Optional[str], phase: Optional[str], round: Optional[int]
+) -> AsyncIterator[AgentEvent]:
+    """Usage-Limit Resilience addon. Yields a `paused` heartbeat every
+    config.RATE_LIMIT_HEARTBEAT_SECONDS while waiting out a usage-limit exhaustion, then a
+    final `resumed` event once the wait is over. Never raises -- run_agent_streaming
+    re-runs the identical call once this generator finishes.
+
+    A parsed retry_at governs the wait; a transient 429 gets a short fixed backoff
+    (config.API_429_BACKOFF_SECONDS); an unparseable subscription-quota message falls back
+    to a fixed poll interval (config.RATE_LIMIT_POLL_SECONDS) -- see _parse_reset_time's
+    docstring for why a machine-readable reset time isn't guaranteed to be available."""
+    now = datetime.now()
+    if err.is_transient_429:
+        wait_seconds = float(config.API_429_BACKOFF_SECONDS)
+        retry_at = now + timedelta(seconds=wait_seconds)
+    elif err.retry_at is not None:
+        retry_at = err.retry_at
+        wait_seconds = max(0.0, (retry_at - now).total_seconds())
+    else:
+        wait_seconds = float(config.RATE_LIMIT_POLL_SECONDS)
+        retry_at = now + timedelta(seconds=wait_seconds)
+
+    retry_at_iso = retry_at.isoformat()
+    reason = str(err).strip() or "usage limit reached"
+    yield AgentEvent(
+        type="paused", phase=phase, round=round, agent=agent, content=reason, retry_at=retry_at_iso
+    )
+
+    remaining = wait_seconds
+    while remaining > 0:
+        chunk = min(remaining, config.RATE_LIMIT_HEARTBEAT_SECONDS)
+        await asyncio.sleep(chunk)
+        remaining -= chunk
+        if remaining > 0:
+            yield AgentEvent(
+                type="paused", phase=phase, round=round, agent=agent,
+                content=reason, retry_at=retry_at_iso,
+            )
+
+    yield AgentEvent(type="resumed", phase=phase, round=round, agent=agent, content="")
+
+
 async def run_agent_streaming(
     *,
     system_prompt_file: str,
@@ -142,6 +307,7 @@ async def run_agent_streaming(
     timeout: Optional[int] = None,
     model: Optional[str] = None,
     effort: Optional[str] = None,
+    wait_on_rate_limit: bool = True,
 ) -> AsyncIterator[AgentEvent]:
     """Spawn the `claude` CLI for one agent turn and yield AgentEvents as output streams in.
 
@@ -154,6 +320,13 @@ async def run_agent_streaming(
 
     Guarded --max-budget-usd: if the CLI rejects the flag as unrecognized (older/newer
     builds), retry once without it -- transparently, before any output has been yielded.
+
+    wait_on_rate_limit (Usage-Limit Resilience addon): when True (default), a detected
+    subscription usage-limit exhaustion pauses this call -- yielding `paused` heartbeats
+    then a `resumed` event (see _wait_for_quota) -- and transparently re-runs the
+    identical call once the quota is expected back, instead of raising. Callers that must
+    fail fast rather than potentially wait hours (e.g. main.py's POST /models/check) pass
+    False, in which case a usage-limit hit surfaces as an ordinary AgentError.
     """
     if mode in ("builder", "read_only") and not cwd:
         raise AgentError(f"mode={mode!r} requires cwd")
@@ -181,22 +354,17 @@ async def run_agent_streaming(
         effort=effort,
     )
 
-    gen = _run_once(**common_kwargs, include_budget_flag=True)
-    try:
-        first_event = await gen.__anext__()
-    except StopAsyncIteration:
+    while True:
+        try:
+            async for event in _run_attempt(**common_kwargs):
+                yield event
+        except RateLimitError as e:
+            if not wait_on_rate_limit:
+                raise
+            async for pause_event in _wait_for_quota(e, agent=agent, phase=phase, round=round):
+                yield pause_event
+            continue  # re-run the identical call from scratch
         return
-    except AgentError as e:
-        if _looks_like_unknown_flag_error(str(e)):
-            print("[runner] --max-budget-usd rejected by this CLI build; retrying without it", file=sys.stderr)
-            gen = _run_once(**common_kwargs, include_budget_flag=False)
-            first_event = await gen.__anext__()
-        else:
-            raise
-
-    yield first_event
-    async for event in gen:
-        yield event
 
 
 async def _run_once(
@@ -244,6 +412,7 @@ async def _run_once(
         return b"".join(chunks)
 
     stdin_task = asyncio.create_task(_feed_stdin(proc))
+    stderr_task: Optional[asyncio.Task] = None
     try:
         async with asyncio.timeout(timeout):
             stderr_task = asyncio.create_task(_drain_stderr(proc))
@@ -254,6 +423,7 @@ async def _run_once(
             cost_usd: Optional[float] = None
             is_error = False
             result_subtype: Optional[str] = None
+            rate_limit_payload: Optional[dict] = None
 
             async for raw_line in proc.stdout:
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -299,7 +469,14 @@ async def _run_once(
                     is_error = bool(obj.get("is_error"))
                     result_subtype = obj.get("subtype")
 
-                # system / rate_limit_event / anything else: ignore gracefully.
+                elif obj_type == "rate_limit_event":
+                    # Previously discarded entirely; captured now so a terminal failure
+                    # can be checked against it in _detect_rate_limit below (Usage-Limit
+                    # Resilience addon) -- the exact shape of this message isn't
+                    # documented, so this is passed through as-is rather than parsed here.
+                    rate_limit_payload = obj
+
+                # system / anything else: ignore gracefully.
 
             await proc.wait()
             stderr_bytes = await stderr_task
@@ -317,6 +494,23 @@ async def _run_once(
         except asyncio.CancelledError:
             pass
         raise AgentError(f"agent call timed out after {timeout}s")
+    except asyncio.CancelledError:
+        # A user-initiated cancel (main.py's POST /run/{run_id}/cancel -> state.task.
+        # cancel(), Usage-Limit Resilience addon) can land here mid-call, e.g. cancelling
+        # a run that isn't currently paused. Without this, asyncio.CancelledError alone
+        # would leave the claude.exe subprocess orphaned -- it doesn't touch the child
+        # process by itself. Mirrors the timeout branch's cleanup, then re-raises so
+        # cancellation propagates as a real cancellation rather than an AgentError:
+        # callers must not retry a deliberate cancel the way they retry a genuine failure.
+        await _kill_process_tree(proc)
+        stdin_task.cancel()
+        if stderr_task is not None:
+            stderr_task.cancel()
+            try:
+                await stderr_task
+            except asyncio.CancelledError:
+                pass
+        raise
     finally:
         # Never leave the feeder task unretrieved -- it only ever swallows its own errors.
         try:
@@ -341,6 +535,15 @@ async def _run_once(
                 content=final_text, cost_usd=cost_usd, truncated=True,
             )
             return
+        # Usage-Limit Resilience addon: check before falling through to a plain
+        # AgentError -- a subscription usage-limit exhaustion (or a transient 429) gets
+        # a distinct exception type so run_agent_streaming can pause-and-resume instead
+        # of the ordinary retry-once-then-fail path.
+        rate_limit_error = _detect_rate_limit(
+            result_text=result_text, stderr_text=stderr_text, rate_limit_payload=rate_limit_payload
+        )
+        if rate_limit_error is not None:
+            raise rate_limit_error
         # stderr is often empty even on failure (e.g. a budget/turn-limit abort reports
         # its reason via the "result" NDJSON event, not stderr) -- prefer whichever
         # actually has content instead of always defaulting to a bare exit code.

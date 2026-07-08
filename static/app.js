@@ -18,7 +18,9 @@
   const roundsInput = document.getElementById("rounds");
   const debateFeedTitle = document.getElementById("debate-feed-title");
   const runBtn = document.getElementById("run-btn");
+  const cancelBtn = document.getElementById("cancel-btn");
   const runErrorEl = document.getElementById("run-error");
+  const pausedBannerEl = document.getElementById("paused-banner");
   const modelSelect = document.getElementById("model-select");
   const modelStatusEl = document.getElementById("model-status");
   const effortSlider = document.getElementById("effort-slider");
@@ -83,6 +85,25 @@
   function hideError() {
     runErrorEl.hidden = true;
     runErrorEl.textContent = "";
+  }
+
+  // Usage-Limit Resilience addon: a distinct banner from showError/hideError above --
+  // a paused run isn't an error, it's expected to resume on its own (or via Cancel).
+  function showPaused(retryAt) {
+    pausedBannerEl.textContent = retryAt
+      ? `Paused — usage limit reached, resumes ~${new Date(retryAt).toLocaleString()}`
+      : "Paused — usage limit reached, waiting to retry…";
+    pausedBannerEl.hidden = false;
+  }
+
+  function hidePaused() {
+    pausedBannerEl.hidden = true;
+    pausedBannerEl.textContent = "";
+  }
+
+  function runDoneLabel(content) {
+    if (!content) return "Done";
+    return /cancelled/i.test(content) ? "Cancelled" : "Finished with errors";
   }
 
   function setProgress(fraction, label) {
@@ -236,7 +257,7 @@
   function updateProgress(ev) {
     const { debateStart, debateEnd, buildStart, buildEnd } = progressSpan();
     if (ev.type === "run_done") {
-      setProgress(1, ev.content ? "Finished with errors" : "Done");
+      setProgress(1, runDoneLabel(ev.content));
       return;
     }
     if (ev.type === "phase_done") {
@@ -301,6 +322,30 @@
         if (ev.content) card.body.textContent += `\n[error] ${ev.content}`;
         break;
       }
+      case "paused": {
+        // Usage-Limit Resilience addon: run_agent_streaming is waiting out a usage-limit
+        // exhaustion and will retry the identical call once it's over -- not a failure,
+        // so no ".error" class here, just a distinct waiting state + the global banner.
+        const card = getOrCreateCard(ev);
+        card.el.classList.add("paused");
+        card.status.textContent = ev.retry_at
+          ? `waiting — resumes ~${new Date(ev.retry_at).toLocaleString()}`
+          : "waiting — usage limit reached";
+        showPaused(ev.retry_at);
+        break;
+      }
+      case "resumed": {
+        // The upcoming retry re-runs the identical call from scratch, so it will
+        // re-stream the whole reply -- clear the stale pre-pause fragment first so it
+        // doesn't get concatenated onto the fresh output (same rationale as the
+        // agent_start retry-clear branch above).
+        const card = getOrCreateCard(ev);
+        card.body.textContent = "";
+        card.status.textContent = "streaming…";
+        card.el.classList.remove("paused");
+        hidePaused();
+        break;
+      }
       case "files_updated":
         refreshFiles();
         break;
@@ -339,9 +384,26 @@
       state.eventSource = null;
     }
     runBtn.disabled = false;
+    cancelBtn.hidden = true;
+    hidePaused();
     clearPersistedRun();
     if (content) showError(content);
     refreshFiles();
+  }
+
+  async function cancelRun() {
+    if (!state.runId) return;
+    cancelBtn.disabled = true;
+    try {
+      await fetch(`/run/${state.runId}/cancel`, { method: "POST" });
+      // No local state change here -- the real _run_pipeline cancellation lands as a
+      // run_done event over the existing SSE stream (finishRun handles it the same as
+      // any other terminal state), so there's nothing to do but wait for it.
+    } catch {
+      // network hiccup; the user can just click Cancel again
+    } finally {
+      cancelBtn.disabled = false;
+    }
   }
 
   function resetFeeds() {
@@ -418,6 +480,8 @@
       state.mode = mode;
       applyModeVisibility(mode);
       resetFeeds();
+      hidePaused();
+      cancelBtn.hidden = false;
       state.numRounds = numRounds;
       persistRun(data.run_id, numRounds, mode);
       connect(data.run_id);
@@ -520,18 +584,21 @@
     modeSelect.value = state.mode;
     applyModeVisibility(state.mode);
     runBtn.disabled = !!status.running;
+    cancelBtn.hidden = !status.running;
     connect(runId);
     if (status.running) {
       setProgress(0, "Recovering…");
+      if (status.paused) showPaused(status.paused_until);
     } else {
       refreshFiles();
-      setProgress(1, status.error ? "Finished with errors" : "Done");
+      setProgress(1, runDoneLabel(status.error));
       clearPersistedRun();
     }
     if (status.error) showError(status.error);
   }
 
   runBtn.addEventListener("click", startRun);
+  cancelBtn.addEventListener("click", cancelRun);
   modelSelect.addEventListener("change", scheduleModelCheck);
   effortSlider.addEventListener("input", updateEffortLabel);
   modeSelect.addEventListener("change", () => applyModeVisibility(modeSelect.value));

@@ -8,6 +8,8 @@
   --card-bg: #ffffff;
   --error-bg: #fdecea;
   --error-fg: #7a1f1f;
+  --paused-bg: #fff6e0;
+  --paused-fg: #8a5a00;
   --accent: #3b6fd6;
 
   --strategist: #3b6fd6;
@@ -30,6 +32,8 @@
     --card-bg: #202226;
     --error-bg: #3a1f1f;
     --error-fg: #f2b2b2;
+    --paused-bg: #3a2f12;
+    --paused-fg: #f2cf7a;
   }
 }
 
@@ -42,6 +46,8 @@
   --card-bg: #202226;
   --error-bg: #3a1f1f;
   --error-fg: #f2b2b2;
+  --paused-bg: #3a2f12;
+  --paused-fg: #f2cf7a;
 }
 
 :root[data-theme="light"] {
@@ -53,6 +59,8 @@
   --card-bg: #ffffff;
   --error-bg: #fdecea;
   --error-fg: #7a1f1f;
+  --paused-bg: #fff6e0;
+  --paused-fg: #8a5a00;
 }
 
 * { box-sizing: border-box; }
@@ -132,6 +140,19 @@ h2 { font-size: 1rem; margin: 0 0 0.5rem; color: var(--muted); }
 
 #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+#cancel-btn {
+  font: inherit;
+  padding: 0.5rem 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+#cancel-btn:hover { background: var(--panel-bg); }
+#cancel-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
 #model-row { flex-wrap: wrap; font-size: 0.85rem; }
 
 #model-row label { color: var(--muted); }
@@ -169,6 +190,16 @@ h2 { font-size: 1rem; margin: 0 0 0.5rem; color: var(--muted); }
 .error-banner {
   background: var(--error-bg);
   color: var(--error-fg);
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  margin: 0.5rem 0 0;
+}
+
+/* Usage-Limit Resilience addon: a distinct, non-alarming state -- a paused run is
+   expected to resume on its own (or via Cancel), unlike .error-banner/.card.error. */
+.paused-banner {
+  background: var(--paused-bg);
+  color: var(--paused-fg);
   padding: 0.5rem 0.75rem;
   border-radius: 6px;
   margin: 0.5rem 0 0;
@@ -282,6 +313,13 @@ h2 { font-size: 1rem; margin: 0 0 0.5rem; color: var(--muted); }
 }
 
 .card.error .card-header { color: var(--error-fg); }
+
+.card.paused {
+  background: var(--paused-bg);
+  border-left-color: var(--paused-fg);
+}
+
+.card.paused .card-header { color: var(--paused-fg); }
 
 #output-panel {
   border: 1px solid var(--border);

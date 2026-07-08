@@ -25,16 +25,22 @@ class AgentEvent:
     """One unit of pipeline activity.
 
     type: agent_start | delta | agent_done | phase_done | files_updated
-          | error | run_done | result
+          | error | run_done | result | paused | resumed
     phase: "debate" | "build" | None
     round: debate round number, or None outside debate
     agent: agent name (e.g. "Strategist") or "system"
     content: meaning depends on `type` (delta text, error message, file
-             listing JSON, full result text, ...)
+             listing JSON, full result text, human-readable pause reason, ...)
     cost_usd: populated on `result` events when the CLI reports a cost
     truncated: on a `result` event, True if the CLI hit its turn limit before
                finishing (subtype "error_max_turns") but had already produced
                usable output -- see agents/runner.py. False for a clean finish.
+    retry_at: on a `paused` event (Usage-Limit Resilience addon), an ISO-8601
+              timestamp string for when the call will be retried, or None if no
+              reset time could be parsed (a fixed poll interval is used instead --
+              see config.RATE_LIMIT_POLL_SECONDS). Lets the UI render a concrete
+              "resumes ~3:45pm" without parsing `content`. Unused on every other
+              event type.
     """
 
     type: str
@@ -44,6 +50,7 @@ class AgentEvent:
     content: str = ""
     cost_usd: Optional[float] = None
     truncated: bool = False
+    retry_at: Optional[str] = None
     seq: int = 0  # stamped by EventBus.emit; 0 until then
 
     def to_dict(self) -> dict:

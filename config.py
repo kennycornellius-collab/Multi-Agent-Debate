@@ -88,3 +88,28 @@ RECON_AGENT = ("codebase/recon.txt", "read_only", RECON_TIMEOUT)  # (prompt file
 # prompt-file override run_build() swaps in when target_mode=True, not a whole new
 # BUILD_AGENTS entry.
 CODER_PATCH_PROMPT_FILE = "codebase/coder_patch.txt"
+
+# Usage-Limit Resilience addon: pause + resume a call instead of failing it when a
+# subscription session/weekly quota is exhausted mid-run (as opposed to a genuine model/
+# CLI error, which still goes through the existing retry-once-then-fail path unchanged).
+# This is a deliberate, narrow exception to the "no rate-limit/backoff engineering" line
+# in SPEC.md's Design Decision section -- see SPEC.md's Error Handling section and the
+# addon section for the reasoning. Only the CLI's user-facing message *wording* is
+# documented (not the NDJSON envelope it arrives in), so detection is substring matching
+# across whatever text is available (result/stderr/rate_limit_event) -- these markers
+# live here, not hardcoded in agents/runner.py, so a future wording change is a one-line
+# config fix instead of a code change.
+RATE_LIMIT_MARKERS = [
+    "hit your session limit",
+    "hit your weekly limit",
+    "hit your opus limit",
+    "usage limit reached",  # generic fallback in case the exact wording drifts
+]
+RATE_LIMIT_TRANSIENT_MARKER = "request rejected (429)"  # a transient API-tier rate limit,
+# distinct from a subscription quota -- the CLI already retries these internally
+# (system/api_retry events), so this is only a safety net if one still bubbles up as a
+# terminal failure; it gets a short fixed backoff, not the long quota-reset wait below.
+
+RATE_LIMIT_POLL_SECONDS = 900       # fallback wait when no reset time is parseable (15 min)
+RATE_LIMIT_HEARTBEAT_SECONDS = 30   # how often a `paused` heartbeat event re-emits while waiting
+API_429_BACKOFF_SECONDS = 30        # short backoff for RATE_LIMIT_TRANSIENT_MARKER

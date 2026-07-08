@@ -75,6 +75,12 @@ class RunState:
     # Critic in round 1, Strategist in round 2); overwriting a single `error` field
     # would silently drop all but the last one from /status and the reload banner.
     errors: list[str] = field(default_factory=list)
+    # Usage-Limit Resilience addon: True while a call is waiting out a usage-limit
+    # exhaustion (agents/runner.py's wait/resume loop, threaded through via `paused`/
+    # `resumed` events). paused_until mirrors the event's retry_at (ISO string, or None
+    # if no reset time was parseable -- see runner.py's _wait_for_quota).
+    paused: bool = False
+    paused_until: Optional[str] = None
     task: Optional[asyncio.Task] = None
 
 
@@ -127,7 +133,7 @@ class ModelCheckRequest(BaseModel):
 
 
 async def _watch_status(state: RunState) -> None:
-    """Keep RunState.phase/round/errors in sync with the bus, for GET /status."""
+    """Keep RunState.phase/round/errors/paused in sync with the bus, for GET /status."""
     async for ev in state.bus.stream():
         if ev.type == "agent_start":
             state.phase = ev.phase
@@ -137,8 +143,20 @@ async def _watch_status(state: RunState) -> None:
             if ev.round is not None:
                 label += f" (round {ev.round})"
             state.errors.append(f"{label}: {ev.content}")
+        elif ev.type == "paused":
+            # Usage-Limit Resilience addon: a call is waiting out a usage-limit
+            # exhaustion. retry_at may be None (no reset time parseable) -- the
+            # heartbeat re-emits periodically either way, so paused_until just tracks
+            # whatever the latest heartbeat said.
+            state.paused = True
+            state.paused_until = ev.retry_at
+        elif ev.type == "resumed":
+            state.paused = False
+            state.paused_until = None
         elif ev.type == "run_done":
             state.running = False
+            state.paused = False
+            state.paused_until = None
 
 
 async def _run_pipeline(state: RunState) -> None:
@@ -233,6 +251,19 @@ async def _run_pipeline(state: RunState) -> None:
             # unlike "full" it does not set fatal_error here.
     except AgentError as e:
         fatal_error = str(e)
+    except asyncio.CancelledError:
+        # Usage-Limit Resilience addon's cancel escape hatch: POST /run/{run_id}/cancel
+        # calls state.task.cancel() (below), which delivers this at whatever await point
+        # _run_pipeline is currently suspended -- most commonly inside a paused wait
+        # (agents/runner.py's _wait_for_quota sleep), but a mid-call cancel is possible
+        # too (agents/runner.py's own _run_once has matching CancelledError cleanup for
+        # that case). Recorded as a clean, expected outcome -- not "internal error: ..." --
+        # so the UI can label it "Cancelled" rather than "Finished with errors". Re-raised
+        # after the finally block below runs its cleanup, so this task's own final state
+        # is correctly "cancelled" rather than "completed" -- mirrors agents/runner.py's
+        # own catch-cleanup-then-re-raise pattern for the same exception.
+        fatal_error = "Run cancelled by user."
+        raise
     except Exception as e:  # a bug here must not leave the run stuck as "running" forever
         # The UI only ever shows the stringified exception -- log the full traceback
         # server-side too, or a genuine bug is nearly impossible to diagnose from the
@@ -319,6 +350,23 @@ async def start_run(req: RunRequest) -> dict:
     return {"run_id": run_id}
 
 
+@app.post("/run/{run_id}/cancel")
+async def cancel_run(run_id: str) -> dict:
+    """Usage-Limit Resilience addon's escape hatch: the pause/resume wait has no time
+    cap by design (a subscription quota can take hours to reset), so this is the only
+    way to stop a run short of killing the server. state.task is the same handle
+    start_run() created -- cancelling it delivers asyncio.CancelledError at whatever
+    await point the pipeline is currently suspended (most often mid-pause), which
+    _run_pipeline's except asyncio.CancelledError clause turns into a clean "Cancelled"
+    run_done instead of an internal-error-looking one."""
+    state = runs.get(run_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="unknown run_id")
+    if state.task is not None:
+        state.task.cancel()
+    return {"cancelled": True}
+
+
 @app.post("/models/check")
 async def check_model(req: ModelCheckRequest) -> dict:
     """Cheap real availability probe for the browser UI's model dropdown/custom input.
@@ -341,6 +389,10 @@ async def check_model(req: ModelCheckRequest) -> dict:
             mode="text_only",
             model=model,
             timeout=60,
+            # Usage-Limit Resilience addon: this endpoint must answer quickly, not
+            # potentially wait out a usage-limit reset -- a rate-limit hit here should
+            # just report as unavailable like any other AgentError.
+            wait_on_rate_limit=False,
         )
         return {"available": True, "message": ""}
     except AgentError as e:
@@ -376,6 +428,11 @@ async def status(run_id: str) -> dict:
         # Joined so the response schema stays a single string (per SPEC.md), but now
         # reflects every failure that occurred during the run, not just the last one.
         "error": "; ".join(state.errors) if state.errors else None,
+        # Usage-Limit Resilience addon: True while a call is waiting out a usage-limit
+        # exhaustion; paused_until is an ISO timestamp when a reset time was parseable,
+        # else None (a fixed poll interval is used instead -- see runner.py).
+        "paused": state.paused,
+        "paused_until": state.paused_until,
     }
 
 
