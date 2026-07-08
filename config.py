@@ -82,3 +82,9 @@ RECON_MAX_TURNS = 20  # lower than BUILD_MAX_TURNS -- no edits to make, just loo
 RECON_MODEL = None    # None = CLI default; independently tunable from DEBATE_MODEL/BUILD_MODEL
 
 RECON_AGENT = ("codebase/recon.txt", "read_only", RECON_TIMEOUT)  # (prompt file, mode, timeout)
+
+# Codebase Analysis Mode, Stage 10: patch-build. Same mode/timeout as the regular Coder
+# (config.BUILD_AGENTS["Coder"]) -- only the persona differs, so this is just the one
+# prompt-file override run_build() swaps in when target_mode=True, not a whole new
+# BUILD_AGENTS entry.
+CODER_PATCH_PROMPT_FILE = "codebase/coder_patch.txt"

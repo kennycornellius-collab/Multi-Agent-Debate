@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -31,6 +33,36 @@ def _walk_build_dir(build_dir: Path) -> list[str]:
         for p in build_dir.rglob("*")
         if p.is_file()
     )
+
+
+def _hash_files(build_dir: Path) -> dict[str, str]:
+    """Codebase Analysis Mode (target_mode), no-git fallback: content hash of every file
+    under build_dir, keyed by relative path. md5 here is a cheap change-detection
+    fingerprint, not a security use -- same convention agents/sandbox.py's own
+    verification already used for its "target_path untouched" checksum."""
+    return {rel: hashlib.md5((build_dir / rel).read_bytes()).hexdigest() for rel in _walk_build_dir(build_dir)}
+
+
+def _changed_files(pre: dict[str, str], post: dict[str, str]) -> list[str]:
+    """Files added, removed, or content-modified between two _hash_files() snapshots."""
+    return sorted(f for f in set(pre) | set(post) if pre.get(f) != post.get(f))
+
+
+def _git_diff(build_dir: Path) -> tuple[str, list[str]]:
+    """Codebase Analysis Mode (target_mode), diff_available path: the cumulative diff
+    against the sandbox's baseline commit (see agents/sandbox.py's _init_baseline_commit),
+    plus the sorted list of touched files. `git add -A` first so brand-new files show up
+    as additions in `git diff --cached` -- a plain `git diff` only covers already-tracked
+    files and would silently miss anything the Coder created from scratch. Safe to call
+    more than once in the same build (e.g. once after Coder, again after Tester); each
+    call reflects the cumulative working-tree state at that moment."""
+    subprocess.run(["git", "add", "-A"], cwd=build_dir, capture_output=True, text=True)
+    diff = subprocess.run(["git", "diff", "--cached"], cwd=build_dir, capture_output=True, text=True)
+    names = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"], cwd=build_dir, capture_output=True, text=True
+    )
+    files = sorted(f for f in names.stdout.splitlines() if f.strip())
+    return diff.stdout, files
 
 
 async def _run_step(
@@ -98,6 +130,8 @@ async def run_build(
     output_dir: Optional[str] = None,
     model: Optional[str] = None,
     effort: Optional[str] = None,
+    target_mode: bool = False,
+    diff_available: bool = False,
 ) -> dict:
     """Run the full build pipeline against an existing debate run. Returns a summary dict.
 
@@ -108,7 +142,20 @@ async def run_build(
     `model`/`effort` are optional per-run overrides (e.g. from the browser UI) applied to
     all four steps; omitted, they fall back to config.py's BUILD_MODEL default via
     agents/runner.py.
-    """
+
+    `target_mode` is Codebase Analysis Mode's hook (SPEC.md Stage 10): when True,
+    `build_dir` is expected to already be a populated sandbox (agents/sandbox.py, run
+    before this) rather than a fresh empty directory -- no scaffolding happens here. The
+    Coder swaps to `config.CODER_PATCH_PROMPT_FILE` (edit-in-place persona), and the old
+    "did build/ end up non-empty?" guard is replaced by "did anything actually change?":
+    an empty diff after the Coder's turn is treated the same way empty-build-dir was
+    before -- error event, Reviewer/Tester skipped. Reviewer and Tester run completely
+    unchanged in target_mode; their prompts don't differ between a fresh tree and a
+    patched existing one (SPEC.md). `diff_available` (from that same prior sandbox-prep
+    call) picks the change-detection mechanism: a real `git diff` against the sandbox's
+    baseline commit when True, or a before/after file-hash comparison when False (no git
+    on PATH) -- the latter can still tell what changed, it just can't produce patch.diff.
+    Ignored when target_mode is False."""
     out_dir = Path(output_dir) if output_dir else Path(config.OUTPUT_DIR) / run_id
     spec_path = out_dir / "agreed_spec.md"
     if not spec_path.is_file():
@@ -122,6 +169,7 @@ async def run_build(
         "build_dir": None,
         "review_path": None,
         "tests_path": None,
+        "patch_diff_path": None,
         "build_ok": False,
         "total_cost_usd": 0.0,
         "warnings": [],
@@ -166,10 +214,22 @@ async def run_build(
 
     # --- Coder ---
     build_dir = out_dir / "build"
-    build_dir.mkdir(parents=True, exist_ok=True)
+    pre_snapshot: Optional[dict[str, str]] = None
+    if target_mode:
+        if not build_dir.is_dir():
+            raise AgentError(
+                f"target_mode requires an already-populated sandbox at {build_dir} -- "
+                "run sandbox prep (agents/sandbox.py) first"
+            )
+        if not diff_available:
+            pre_snapshot = await asyncio.to_thread(_hash_files, build_dir)
+    else:
+        build_dir.mkdir(parents=True, exist_ok=True)
     result["build_dir"] = str(build_dir)
 
     coder_prompt_file, coder_mode, coder_timeout = config.BUILD_AGENTS["Coder"]
+    if target_mode:
+        coder_prompt_file = config.CODER_PATCH_PROMPT_FILE
     coder_stdin = (
         "=== AGREED SPEC ===\n"
         + spec_text.strip()
@@ -177,11 +237,19 @@ async def run_build(
         + arch_text.strip()
         + "\n"
     )
-    coder_instruction = (
-        "Read the agreed spec and architecture blueprint on stdin, then create the files "
-        "directly in the current working directory following the File Tree and Build Order. "
-        "Follow your stdout-format rules exactly."
-    )
+    if target_mode:
+        coder_instruction = (
+            "Read the agreed spec and architecture blueprint on stdin, then read the relevant "
+            "existing files in the current working directory and make the smallest correct "
+            "edit(s) that satisfy the File Plan -- prefer editing over creating, and do not "
+            "touch anything outside the spec's scope. Follow your stdout-format rules exactly."
+        )
+    else:
+        coder_instruction = (
+            "Read the agreed spec and architecture blueprint on stdin, then create the files "
+            "directly in the current working directory following the File Tree and Build Order. "
+            "Follow your stdout-format rules exactly."
+        )
     _, coder_cost, coder_truncated = await _run_step(
         bus,
         agent="Coder",
@@ -199,24 +267,34 @@ async def run_build(
     if coder_truncated:
         result["warnings"].append("Coder hit the turn limit; using the output produced so far.")
 
-    files = _walk_build_dir(build_dir)
+    if target_mode:
+        if diff_available:
+            _, files = await asyncio.to_thread(_git_diff, build_dir)
+        else:
+            post_snapshot = await asyncio.to_thread(_hash_files, build_dir)
+            files = _changed_files(pre_snapshot, post_snapshot)
+            result["warnings"].append(
+                "git unavailable for this sandbox; change detection used a file-hash "
+                "comparison instead, and no patch.diff will be produced this run."
+            )
+    else:
+        files = _walk_build_dir(build_dir)
     build_ok = bool(files)
     result["build_ok"] = build_ok
 
     if not build_ok:
-        bus.emit(
-            AgentEvent(
-                type="error",
-                phase="build",
-                agent="Coder",
-                content="Coder produced no files in build/; skipping Reviewer and Tester.",
-            )
+        reason = "coder_made_no_changes" if target_mode else "coder_produced_nothing"
+        message = (
+            "Coder made no changes to the sandbox; skipping Reviewer and Tester."
+            if target_mode
+            else "Coder produced no files in build/; skipping Reviewer and Tester."
         )
+        bus.emit(AgentEvent(type="error", phase="build", agent="Coder", content=message))
         bus.emit(
             AgentEvent(
                 type="phase_done",
                 phase="build",
-                content=json.dumps({**result, "reason": "coder_produced_nothing"}),
+                content=json.dumps({**result, "reason": reason}),
             )
         )
         return result
@@ -292,16 +370,43 @@ async def run_build(
     else:
         result["tests_path"] = None
 
-    bus.emit(
-        AgentEvent(type="files_updated", phase="build", content=json.dumps(_walk_build_dir(build_dir)))
-    )
+    # Final files_updated: recomputed, not the Coder-step snapshot, since Reviewer/Tester
+    # may have added/changed files too (e.g. Tester's own test files). In target_mode this
+    # is the touched-files-only list (not the whole sandbox tree -- a real target codebase
+    # can have hundreds of unrelated files, and dumping all of them into the UI's file
+    # panel on every files_updated would be noise); a real target_mode also writes
+    # patch.diff here, once, covering the whole build phase's cumulative changes.
+    if target_mode:
+        if diff_available:
+            diff_text, final_files = await asyncio.to_thread(_git_diff, build_dir)
+            if diff_text:
+                patch_path = out_dir / "patch.diff"
+                patch_path.write_text(diff_text, encoding="utf-8")
+                result["patch_diff_path"] = str(patch_path)
+        else:
+            post_snapshot = await asyncio.to_thread(_hash_files, build_dir)
+            final_files = _changed_files(pre_snapshot, post_snapshot)
+        bus.emit(AgentEvent(type="files_updated", phase="build", content=json.dumps(final_files)))
+    else:
+        bus.emit(
+            AgentEvent(type="files_updated", phase="build", content=json.dumps(_walk_build_dir(build_dir)))
+        )
     bus.emit(AgentEvent(type="phase_done", phase="build", content=json.dumps(result)))
 
     return result
 
 
-async def _headless_main(run_id: str) -> None:
+async def _headless_main(run_id: str, target_mode: bool = False) -> None:
     bus = EventBus()
+
+    diff_available = False
+    if target_mode:
+        # Standalone headless test convenience: infer diff_available from whether the
+        # sandbox (agents/sandbox.py) actually got a baseline commit, rather than
+        # requiring a separate flag here. Stage 11's real orchestration will instead pass
+        # the value straight through from that earlier prepare_sandbox() call.
+        build_dir = Path(config.OUTPUT_DIR) / run_id / "build"
+        diff_available = (build_dir / ".git").is_dir()
 
     async def _consume() -> None:
         async for ev in bus.stream():
@@ -321,7 +426,9 @@ async def _headless_main(run_id: str) -> None:
 
     consumer_task = asyncio.create_task(_consume())
     try:
-        result = await run_build(run_id=run_id, bus=bus)
+        result = await run_build(
+            run_id=run_id, bus=bus, target_mode=target_mode, diff_available=diff_available
+        )
     except AgentError as e:
         bus.close()
         await consumer_task
@@ -335,6 +442,7 @@ async def _headless_main(run_id: str) -> None:
     print(f"build_dir: {result['build_dir']} (build_ok={result['build_ok']})")
     print(f"review: {result['review_path']}")
     print(f"tests: {result['tests_path']}")
+    print(f"patch_diff: {result['patch_diff_path']}")
     print(f"total_cost_usd: ${result['total_cost_usd']:.4f}")
     if result.get("warnings"):
         print("warnings:")
@@ -347,6 +455,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         description="Run the Phase 2 build pipeline headlessly against an existing debate run."
     )
     parser.add_argument("run_id", help="run id of an existing output/<run-id>/ containing agreed_spec.md")
+    parser.add_argument(
+        "--target-mode",
+        action="store_true",
+        help="Codebase Analysis Mode: build_dir is an already-populated sandbox (agents/sandbox.py) "
+        "to patch in place, not a fresh empty directory to scaffold",
+    )
     return parser.parse_args(argv)
 
 
@@ -358,4 +472,4 @@ if __name__ == "__main__":
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     args = _parse_args(sys.argv[1:])
-    asyncio.run(_headless_main(args.run_id))
+    asyncio.run(_headless_main(args.run_id, target_mode=args.target_mode))
