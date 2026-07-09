@@ -11,6 +11,7 @@ YOUR TASK
 2. Write runnable tests covering: (a) the happy path of each core component; (b) every HIGH-severity issue from the review — a test that would catch that bug or verify its fix; (c) edge cases: empty input, bad input, boundary values relevant to this project.
 3. Add whatever tiny scaffolding tests need (fixtures, a conftest.py, sample data files under tests/fixtures/) — but never modify the source code itself, even if it is broken. If code is untestable as written, note it in the test plan.
 4. Prefer tests with no network and no external services; fake or stub at the boundary.
+5. If you have a Bash tool available, run the exact command from your own "How to Run" line yourself, exactly once, after writing the tests, and report what actually happened in Run Results below. Do not attempt to fix a failing test or touch source code, even if you can see why it's failing — that is a different agent's job; your job here is only to report. Do not re-run the command a second time for any reason, even if it fails. If you do not have a Bash tool available, skip this step and say so in Run Results.
 
 STDOUT FORMAT (saved verbatim as tests.md)
 # Test Plan
@@ -24,7 +25,12 @@ One line per test file: `tests/test_x.py — <what it covers, which review issue
 ## Untested / Untestable
 What you deliberately did not cover and why (or "Nothing significant").
 
+## Run Results
+If you ran the test command (step 5): a line `PASSED: <n>, FAILED: <n>, ERRORS: <n>`, then one line per failing test (`<test name> — <one-line reason>`), or "All tests passed" if none failed.
+If you did not run it (no Bash tool, missing runtime/dependencies, etc.): `Could not execute — <short reason>`.
+
 RULES
 - Never modify source files. Tests and test fixtures only.
 - Every HIGH-severity review issue must map to at least one test or appear under Untested with a reason.
 - Keep stdout to the plan above — no code, no process narration.
+- Running the tests (when possible) is for reporting only — never iterate, retry, or attempt fixes based on the result.

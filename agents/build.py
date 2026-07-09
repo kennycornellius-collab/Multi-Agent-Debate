@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,27 @@ from typing import Optional
 import config
 from agents.events import AgentEvent, EventBus
 from agents.runner import AgentError, run_agent_streaming
+
+_RUN_RESULTS_RE = re.compile(
+    r"##\s*Run Results\s*\n+PASSED:\s*(\d+),\s*FAILED:\s*(\d+),\s*ERRORS:\s*(\d+)",
+    re.IGNORECASE,
+)
+
+
+def _parse_test_results(tests_text: Optional[str]) -> tuple[Optional[bool], Optional[str]]:
+    """Best-effort extraction of Tester's '## Run Results' section (Test Execution addon,
+    only populated when allow_exec=True) into (tests_passed, test_summary). Returns
+    (None, None) when the section is missing/unparseable -- e.g. allow_exec=False, Tester
+    reported "Could not execute", or Tester's stdout didn't follow the format -- rather
+    than raising. This is a display convenience, not a strict contract on Tester's output."""
+    if not tests_text:
+        return None, None
+    match = _RUN_RESULTS_RE.search(tests_text)
+    if not match:
+        return None, None
+    passed, failed, errors = (int(x) for x in match.groups())
+    summary = f"PASSED: {passed}, FAILED: {failed}, ERRORS: {errors}"
+    return (failed == 0 and errors == 0), summary
 
 
 def _walk_build_dir(build_dir: Path) -> list[str]:
@@ -78,6 +100,7 @@ async def _run_step(
     timeout: Optional[int] = None,
     model: Optional[str] = None,
     effort: Optional[str] = None,
+    max_turns: Optional[int] = None,
 ) -> tuple[Optional[str], float, bool]:
     """Run one build step, streaming deltas onto the bus. Retries once on AgentError;
     on a second failure, emits an `error` event and returns (None, 0.0, False) so the
@@ -109,6 +132,7 @@ async def _run_step(
                 timeout=timeout,
                 model=model,
                 effort=effort,
+                max_turns=max_turns,
             ):
                 if event.type == "delta":
                     bus.emit(event)
@@ -156,6 +180,7 @@ async def run_build(
     target_mode: bool = False,
     diff_available: bool = False,
     cost_state: Optional[list[float]] = None,
+    allow_exec: bool = False,
 ) -> dict:
     """Run the full build pipeline against an existing debate run. Returns a summary dict.
 
@@ -184,7 +209,16 @@ async def run_build(
     `cost_state` lets a caller (main.py's _run_pipeline) share one running-total
     accumulator across multiple phases (e.g. debate -> build) so the frontend's
     cumulative cost display doesn't reset between phases. Defaults to a fresh [0.0]
-    for headless/standalone callers that only ever run this one phase."""
+    for headless/standalone callers that only ever run this one phase.
+
+    `allow_exec` (Test Execution addon, SPEC.md v6): opt-in, default False. When True,
+    the Tester runs in "builder_exec" mode (agents/runner.py) instead of plain "builder"
+    and actually invokes the test command it documents, once, recording real PASSED/
+    FAILED/ERRORS counts in tests.md's new Run Results section (parsed into this
+    function's result dict as tests_passed/test_summary, best-effort). When False (the
+    default, and every run before this addon), behavior is unchanged: Tester never gets
+    a Bash tool, tests.md's Run Results section reports "Could not execute", and
+    tests_passed/test_summary come back None."""
     out_dir = Path(output_dir) if output_dir else Path(config.OUTPUT_DIR) / run_id
     spec_path = out_dir / "agreed_spec.md"
     if not spec_path.is_file():
@@ -204,6 +238,8 @@ async def run_build(
         "build_ok": False,
         "total_cost_usd": 0.0,
         "warnings": [],
+        "tests_passed": None,
+        "test_summary": None,
     }
 
     # --- Architect ---
@@ -375,6 +411,14 @@ async def run_build(
 
     # --- Tester ---
     tester_prompt_file, tester_mode, tester_timeout = config.BUILD_AGENTS["Tester"]
+    tester_max_turns: Optional[int] = None
+    if allow_exec:
+        # Test Execution addon (SPEC.md v6), opt-in only -- "builder" (registry default)
+        # never gets a Bash tool at all, so this only takes effect when a run explicitly
+        # asks for it. tester.txt's own instructions are mode-agnostic (it checks whether
+        # a Bash tool is actually available to it), so no prompt-file swap is needed here.
+        tester_mode = "builder_exec"
+        tester_max_turns = config.TESTER_MAX_TURNS
     tester_instruction = (
         "Read the review on stdin (or use your own judgment if none was produced) and the "
         "code in the current working directory, then create the test files directly and "
@@ -392,6 +436,7 @@ async def run_build(
         timeout=tester_timeout,
         model=model,
         effort=effort,
+        max_turns=tester_max_turns,
     )
     result["total_cost_usd"] = cost_state[0]
     if tester_truncated:
@@ -401,6 +446,7 @@ async def run_build(
         tests_path = out_dir / "tests.md"
         tests_path.write_text(tests_text, encoding="utf-8")
         result["tests_path"] = str(tests_path)
+        result["tests_passed"], result["test_summary"] = _parse_test_results(tests_text)
     else:
         result["tests_path"] = None
 
@@ -432,7 +478,7 @@ async def run_build(
     return result
 
 
-async def _headless_main(run_id: str, target_mode: bool = False) -> None:
+async def _headless_main(run_id: str, target_mode: bool = False, allow_exec: bool = False) -> None:
     bus = EventBus()
 
     diff_available = False
@@ -463,7 +509,11 @@ async def _headless_main(run_id: str, target_mode: bool = False) -> None:
     consumer_task = asyncio.create_task(_consume())
     try:
         result = await run_build(
-            run_id=run_id, bus=bus, target_mode=target_mode, diff_available=diff_available
+            run_id=run_id,
+            bus=bus,
+            target_mode=target_mode,
+            diff_available=diff_available,
+            allow_exec=allow_exec,
         )
     except AgentError as e:
         bus.close()
@@ -478,6 +528,8 @@ async def _headless_main(run_id: str, target_mode: bool = False) -> None:
     print(f"build_dir: {result['build_dir']} (build_ok={result['build_ok']})")
     print(f"review: {result['review_path']}")
     print(f"tests: {result['tests_path']}")
+    if result.get("test_summary"):
+        print(f"test_summary: {result['test_summary']} (tests_passed={result['tests_passed']})")
     print(f"patch_diff: {result['patch_diff_path']}")
     print(f"total_cost_usd: ${result['total_cost_usd']:.4f}")
     if result.get("warnings"):
@@ -497,6 +549,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Codebase Analysis Mode: build_dir is an already-populated sandbox (agents/sandbox.py) "
         "to patch in place, not a fresh empty directory to scaffold",
     )
+    parser.add_argument(
+        "--allow-exec",
+        action="store_true",
+        help="Test Execution addon: let the Tester actually run the tests it writes (builder_exec "
+        "mode, opt-in, default off)",
+    )
     return parser.parse_args(argv)
 
 
@@ -508,4 +566,4 @@ if __name__ == "__main__":
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     args = _parse_args(sys.argv[1:])
-    asyncio.run(_headless_main(args.run_id, target_mode=args.target_mode))
+    asyncio.run(_headless_main(args.run_id, target_mode=args.target_mode, allow_exec=args.allow_exec))

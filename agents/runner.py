@@ -52,10 +52,11 @@ def _build_args(
     *,
     prompt_path: Path,
     instruction: str,
-    mode: Literal["text_only", "builder", "read_only"],
+    mode: Literal["text_only", "builder", "read_only", "builder_exec"],
     include_budget_flag: bool,
     model: Optional[str] = None,
     effort: Optional[str] = None,
+    max_turns: Optional[int] = None,
 ) -> list[str]:
     args = [
         "-p",
@@ -72,11 +73,16 @@ def _build_args(
         args += ["--tools", "", "--max-turns", "1"]
         default_model = config.DEBATE_MODEL
     elif mode == "builder":
+        # Explicit --tools (no Bash) rather than relying on the CLI's "all built-in
+        # tools" default: --permission-mode acceptEdits auto-approves every tool call,
+        # not just Edit/Write, so omitting --tools here would silently hand Coder/
+        # Reviewer a real, unrestricted shell -- confirmed empirically (a call with
+        # acceptEdits and no --tools restriction ran an arbitrary Bash command with zero
+        # denial), not just assumed. File tools only, by construction.
         args += [
-            "--permission-mode",
-            "acceptEdits",
-            "--max-turns",
-            str(config.BUILD_MAX_TURNS),
+            "--tools", "Read,Edit,Write",
+            "--permission-mode", "acceptEdits",
+            "--max-turns", str(max_turns or config.BUILD_MAX_TURNS),
         ]
         default_model = config.BUILD_MODEL
     elif mode == "read_only":
@@ -84,8 +90,31 @@ def _build_args(
         # Edit/Write/Bash -- confirmed against the real CLI that this needs no
         # --permission-mode flag (there's nothing to grant permission for) and doesn't
         # hang waiting on a prompt it can never receive non-interactively.
-        args += ["--tools", "Read,Glob,Grep", "--max-turns", str(config.RECON_MAX_TURNS)]
+        args += ["--tools", "Read,Glob,Grep", "--max-turns", str(max_turns or config.RECON_MAX_TURNS)]
         default_model = config.RECON_MODEL
+    elif mode == "builder_exec":
+        # Test Execution + BugFixer Agent addon (SPEC.md v6): "builder" plus a real Bash
+        # grant. Confirmed empirically this needs all three pieces, not just acceptEdits:
+        # acceptEdits alone auto-approves *some* Bash commands via an internal risk
+        # classifier (trivial/read-only-looking ones), but denies commands that look
+        # consequential (pip install, running a test suite) with no one able to approve
+        # them non-interactively -- --allowedTools pre-approves exactly those past the
+        # classifier (config.BUILD_EXEC_ALLOWED_TOOLS, a curated cross-ecosystem list of
+        # install/test-runner invocations). --disallowedTools then hard-blocks known-
+        # dangerous prefixes (config.BUILD_EXEC_DISALLOWED_TOOLS) regardless of the
+        # above -- confirmed with a real call in the same session as an allowed command.
+        # Still not a hard sandbox: anything not on the denylist and not requiring
+        # classifier approval can run. See SPEC.md's Test Execution addon for the full
+        # empirical trail and the other mitigations (cwd confinement, tight max-turns,
+        # prompt-level restraint) this relies on alongside these flags.
+        args += [
+            "--tools", "Read,Edit,Write,Bash",
+            "--permission-mode", "acceptEdits",
+            "--allowedTools", " ".join(config.BUILD_EXEC_ALLOWED_TOOLS),
+            "--disallowedTools", " ".join(config.BUILD_EXEC_DISALLOWED_TOOLS),
+            "--max-turns", str(max_turns or config.BUILD_MAX_TURNS),
+        ]
+        default_model = config.BUILD_MODEL
     else:
         raise AgentError(f"unknown mode: {mode!r}")
 
@@ -299,7 +328,7 @@ async def run_agent_streaming(
     system_prompt_file: str,
     stdin_text: str,
     instruction: str,
-    mode: Literal["text_only", "builder", "read_only"],
+    mode: Literal["text_only", "builder", "read_only", "builder_exec"],
     agent: Optional[str] = None,
     phase: Optional[str] = None,
     round: Optional[int] = None,
@@ -307,6 +336,7 @@ async def run_agent_streaming(
     timeout: Optional[int] = None,
     model: Optional[str] = None,
     effort: Optional[str] = None,
+    max_turns: Optional[int] = None,
     wait_on_rate_limit: bool = True,
 ) -> AsyncIterator[AgentEvent]:
     """Spawn the `claude` CLI for one agent turn and yield AgentEvents as output streams in.
@@ -318,6 +348,11 @@ async def run_agent_streaming(
     omitted, `_build_args` falls back to config.py's per-mode DEBATE_MODEL/BUILD_MODEL/
     RECON_MODEL default, unchanged from before these params existed.
 
+    `max_turns` is an optional per-call override of the mode's default turn budget --
+    added for "builder_exec" (Test Execution addon), which is shared by agents with
+    different budgets (Tester's TESTER_MAX_TURNS today, BugFixer's own budget later);
+    omitted, each mode falls back to its own config.py default unchanged.
+
     Guarded --max-budget-usd: if the CLI rejects the flag as unrecognized (older/newer
     builds), retry once without it -- transparently, before any output has been yielded.
 
@@ -328,7 +363,7 @@ async def run_agent_streaming(
     fail fast rather than potentially wait hours (e.g. main.py's POST /models/check) pass
     False, in which case a usage-limit hit surfaces as an ordinary AgentError.
     """
-    if mode in ("builder", "read_only") and not cwd:
+    if mode in ("builder", "read_only", "builder_exec") and not cwd:
         raise AgentError(f"mode={mode!r} requires cwd")
 
     prompt_path = _resolve_prompt_file(system_prompt_file)
@@ -352,6 +387,7 @@ async def run_agent_streaming(
         timeout=timeout,
         model=model,
         effort=effort,
+        max_turns=max_turns,
     )
 
     while True:
@@ -372,7 +408,7 @@ async def _run_once(
     prompt_path: Path,
     stdin_text: str,
     instruction: str,
-    mode: Literal["text_only", "builder", "read_only"],
+    mode: Literal["text_only", "builder", "read_only", "builder_exec"],
     agent: Optional[str],
     phase: Optional[str],
     round: Optional[int],
@@ -381,6 +417,7 @@ async def _run_once(
     include_budget_flag: bool,
     model: Optional[str] = None,
     effort: Optional[str] = None,
+    max_turns: Optional[int] = None,
 ) -> AsyncIterator[AgentEvent]:
     args = _build_args(
         prompt_path=prompt_path,
@@ -389,6 +426,7 @@ async def _run_once(
         include_budget_flag=include_budget_flag,
         model=model,
         effort=effort,
+        max_turns=max_turns,
     )
     proc = await _spawn(args, cwd=cwd)
 

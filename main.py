@@ -69,6 +69,9 @@ class RunState:
     round: Optional[int] = None
     model: Optional[str] = None
     effort: Optional[str] = None
+    # Test Execution addon (SPEC.md v6): opt-in, default False. See RunRequest's field
+    # for the full rationale (why this defaults off).
+    allow_test_execution: bool = False
     running: bool = True
     # Every error that happened during the run, in order -- not just the most recent
     # one. A run can have several agents fail permanently at different points (e.g.
@@ -126,6 +129,15 @@ class RunRequest(BaseModel):
     # GitHub (SPEC.md). Only ever read once by the sandbox-prep step; never written to.
     # Ignored otherwise.
     target_path: str = ""
+    # Test Execution addon (SPEC.md v6): opt-in, default False. When True, the Tester
+    # actually invokes the test command it documents (builder_exec mode, a real Bash
+    # grant scoped by a command-prefix denylist -- config.BUILD_EXEC_DISALLOWED_TOOLS,
+    # not an allowlist -- see agents/runner.py). Defaults off because this is a genuine,
+    # new category of risk -- especially for mode="codebase", where it means executing
+    # code from the analyzed target_path, not just this pipeline's own output. When
+    # False (every run before this addon, and every run that doesn't opt in), behavior
+    # is byte-for-byte unchanged: Tester never gets a Bash tool.
+    allow_test_execution: bool = False
 
 
 class ModelCheckRequest(BaseModel):
@@ -185,6 +197,7 @@ async def _run_pipeline(state: RunState) -> None:
                 model=state.model,
                 effort=state.effort,
                 cost_state=cost_state,
+                allow_exec=state.allow_test_execution,
             )
         elif state.mode == "codebase":
             # Codebase Analysis Mode (SPEC.md addon): chain Stage 7 (sandbox) -> Stage 8
@@ -239,6 +252,7 @@ async def _run_pipeline(state: RunState) -> None:
                         target_mode=True,
                         diff_available=diff_available,
                         cost_state=cost_state,
+                        allow_exec=state.allow_test_execution,
                     )
                 else:
                     fatal_error = "Debate phase ended without an agreed spec; build phase skipped."
@@ -260,6 +274,7 @@ async def _run_pipeline(state: RunState) -> None:
                         model=state.model,
                         effort=state.effort,
                         cost_state=cost_state,
+                        allow_exec=state.allow_test_execution,
                     )
                 else:
                     fatal_error = "Debate phase ended without an agreed spec; build phase skipped."
@@ -362,6 +377,7 @@ async def start_run(req: RunRequest) -> dict:
         target_path=req.target_path,
         model=model,
         effort=effort,
+        allow_test_execution=req.allow_test_execution,
     )
     runs[run_id] = state
     state.task = asyncio.create_task(_run_pipeline(state))

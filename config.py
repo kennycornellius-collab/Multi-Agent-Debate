@@ -61,6 +61,68 @@ BUILD_AGENTS = {
     "Tester": ("build/tester.txt", "builder", TESTER_TIMEOUT),
 }
 
+# Test Execution addon (SPEC.md v6), Stage 14. Tester runs in "builder_exec" mode
+# (agents/runner.py) instead of plain "builder" only when a run explicitly opts in
+# (POST /run's allow_test_execution, default False) -- see agents/build.py's run_build().
+# Separate turn budget from BUILD_MAX_TURNS: write tests + exactly one test-command run,
+# not a write-heavy multi-file session.
+TESTER_MAX_TURNS = 40
+
+# Confirmed empirically against the installed CLI (three real, separate mechanisms, not
+# one -- see SPEC.md's Test Execution addon for the full trail):
+#   1. --tools is the structural gate: Bash absent from --tools means the tool doesn't
+#      exist for the model at all, regardless of permission mode.
+#   2. --permission-mode acceptEdits auto-approves *some* Bash commands by default (a
+#      real internal risk classifier judges these, not a flag we control) -- trivial/
+#      read-only-looking commands (echo, whoami, mkdir) passed with zero denial in
+#      testing, but commands that look consequential (pip install, running a test
+#      suite) got denied even under acceptEdits, with no one able to approve them
+#      non-interactively. --allowedTools genuinely fixes this: a command matching an
+#      allow pattern (confirmed with a real call: "Bash(pip install*)"/
+#      "Bash(python -m pytest*)") pre-approves it past that classifier.
+#   3. --disallowedTools genuinely blocks a matching prefix regardless of the above --
+#      confirmed with a real call ("Bash(git push*)" denied "git push origin main
+#      --dry-run" while an unrelated allowed command still ran in the same session).
+# So builder_exec combines all three: Bash only exists via --tools, a curated allowlist
+# of common install/test-runner invocations (below) so the classifier doesn't silently
+# swallow the one thing this mode exists for, and a denylist of known-dangerous prefixes
+# as a hard backstop that still applies on top. This is still not a hard sandbox --
+# anything not on the denylist and not requiring classifier approval can run -- layered
+# with cwd confinement to the disposable build/sandbox dir, a tight max-turns budget, and
+# prompt-level instruction (run the documented command once, never iterate).
+BUILD_EXEC_ALLOWED_TOOLS = [
+    # Python
+    "Bash(pip install*)", "Bash(pip3 install*)", "Bash(python -m pip install*)",
+    "Bash(pytest*)", "Bash(python -m pytest*)", "Bash(python -m unittest*)",
+    # Node/JS
+    "Bash(npm install*)", "Bash(npm ci*)", "Bash(npm test*)", "Bash(npm run test*)",
+    "Bash(yarn install*)", "Bash(yarn test*)", "Bash(pnpm install*)", "Bash(pnpm test*)",
+    # Go / Rust
+    "Bash(go test*)", "Bash(go build*)", "Bash(go mod download*)", "Bash(go mod tidy*)",
+    "Bash(cargo test*)", "Bash(cargo build*)",
+    # JVM
+    "Bash(mvn test*)", "Bash(mvn install*)", "Bash(gradle test*)", "Bash(./gradlew test*)",
+    # .NET / Ruby
+    "Bash(dotnet test*)", "Bash(dotnet restore*)", "Bash(dotnet build*)",
+    "Bash(bundle install*)", "Bash(rspec*)", "Bash(rake test*)",
+]
+
+BUILD_EXEC_DISALLOWED_TOOLS = [
+    # Destructive filesystem ops
+    "Bash(rm *)", "Bash(rd *)", "Bash(rmdir *)", "Bash(del *)", "Bash(erase *)",
+    "Bash(format *)", "Bash(mkfs*)",
+    # Network / remote access
+    "Bash(curl *)", "Bash(wget *)", "Bash(nc *)", "Bash(netcat *)",
+    "Bash(ssh *)", "Bash(scp *)", "Bash(sftp *)", "Bash(ftp *)",
+    # Git operations that could discard history or reach a remote
+    "Bash(git push*)", "Bash(git reset --hard*)", "Bash(git clean*)",
+    # Privilege / process / system control
+    "Bash(sudo *)", "Bash(su *)", "Bash(shutdown*)", "Bash(reboot*)",
+    "Bash(taskkill*)", "Bash(kill *)", "Bash(Stop-Process*)",
+    # Permission/ownership changes
+    "Bash(chmod *)", "Bash(chown *)", "Bash(icacls*)", "Bash(takeown*)",
+]
+
 # Codebase Analysis Mode (SPEC.md addon), Stage 7: sandbox preparation.
 # Directories/files excluded when copying the user's real codebase into the
 # sandbox -- matched by name at every tree level via shutil.ignore_patterns.
