@@ -135,6 +135,23 @@ async def prepare_sandbox(
         )
     )
 
+    # Computed with the same shutil.ignore_patterns matcher copytree itself uses below,
+    # so this can never drift out of sync with what actually gets excluded. Scoped to
+    # the top level only: SANDBOX_IGNORE is designed to skip real build-artifact/vendor
+    # noise (a JS project's dist/, node_modules/, ...) at any depth, but a top-level
+    # collision is the one worth calling out explicitly -- e.g. this tool's own
+    # output/<run-id>/build/ holds the actual generated source, not a throwaway build
+    # artifact, so pointing target_path at a prior run's output dir would otherwise
+    # silently analyze only agreed_spec.md/review.md/etc. and never see any real code.
+    top_level_names = [p.name for p in src.iterdir()]
+    ignored_at_top = sorted(shutil.ignore_patterns(*config.SANDBOX_IGNORE)(str(src), top_level_names))
+    if ignored_at_top:
+        result["warnings"].append(
+            f"{', '.join(ignored_at_top)} excluded by the sandbox ignore list at the top level of "
+            f"target_path -- if this contains code you want analyzed (e.g. it's a prior run's own "
+            f"build/ output), point target_path directly at that subdirectory instead."
+        )
+
     try:
         await asyncio.to_thread(
             shutil.copytree, src, build_dir, ignore=shutil.ignore_patterns(*config.SANDBOX_IGNORE)
@@ -172,6 +189,12 @@ async def prepare_sandbox(
     result["ok"] = True
     done_content = f"Copied {files_copied} file(s)"
     done_content += "; git baseline committed" if baseline_committed else "; diff unavailable this run"
+    # Surface every warning (the top-level ignore-list note above, plus any git-related
+    # one from _init_baseline_commit) directly on the visible Sandbox card -- same
+    # "done (...)" suffix convention build.py's turn-limit warnings already use, rather
+    # than leaving this only in the phase_done JSON blob the UI never parses.
+    if result["warnings"]:
+        done_content += "; " + "; ".join(result["warnings"])
     bus.emit(AgentEvent(type="agent_done", phase="sandbox", agent="system", content=done_content))
     bus.emit(AgentEvent(type="phase_done", phase="sandbox", content=json.dumps(result)))
     return result
