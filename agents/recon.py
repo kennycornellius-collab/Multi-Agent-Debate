@@ -26,11 +26,17 @@ async def _run_recon_turn(
     *,
     sandbox_dir: str,
     description: str,
+    cost_state: list[float],
 ) -> tuple[Optional[str], float, bool]:
     """Run the Recon agent once, streaming deltas onto the bus. Retries once on
     AgentError; on a second failure, emits an `error` event and returns
     (None, 0.0, False) so the caller can fall back to the raw description alone --
-    mirrors debate.py's _run_turn / build.py's _run_step retry-once pattern."""
+    mirrors debate.py's _run_turn / build.py's _run_step retry-once pattern.
+
+    `cost_state` is a single-element list shared across the whole run (recon is always
+    the first phase in codebase mode -- see main.py's _run_pipeline), mutated in place
+    so this call's cost is folded into the running total before agent_done/error is
+    emitted -- see debate.py's _run_turn for the identical rationale."""
     prompt_file, mode, timeout = config.RECON_AGENT
     for attempt in (1, 2):
         bus.emit(AgentEvent(type="agent_start", phase="recon", agent="Recon"))
@@ -64,14 +70,25 @@ async def _run_recon_turn(
                     full_text = event.content
                     cost_usd = event.cost_usd or 0.0
                     truncated = event.truncated
+            cost_state[0] += cost_usd
             done_content = "hit the turn limit; using the output produced so far" if truncated else ""
-            bus.emit(AgentEvent(type="agent_done", phase="recon", agent="Recon", content=done_content))
+            bus.emit(
+                AgentEvent(
+                    type="agent_done",
+                    phase="recon",
+                    agent="Recon",
+                    content=done_content,
+                    cost_usd=cost_state[0],
+                )
+            )
             return full_text, cost_usd, truncated
         except AgentError as e:
             if attempt == 1:
                 continue
             tail = str(e).strip()[-500:]
-            bus.emit(AgentEvent(type="error", phase="recon", agent="Recon", content=tail))
+            bus.emit(
+                AgentEvent(type="error", phase="recon", agent="Recon", content=tail, cost_usd=cost_state[0])
+            )
             return None, 0.0, False
 
     return None, 0.0, False  # unreachable, keeps type checkers happy
@@ -83,6 +100,7 @@ async def run_recon(
     description: str,
     bus: EventBus,
     output_dir: Optional[str] = None,
+    cost_state: Optional[list[float]] = None,
 ) -> dict:
     """Run the Recon agent against an already-prepared sandbox (agents/sandbox.py).
 
@@ -90,14 +108,23 @@ async def run_recon(
     or a graceful fallback note if Recon failed twice -- so callers (Stage 9's debate
     loop) never have to special-case a missing Recon step. Writes codebase_context.md
     only when Recon actually produced text and an output_dir was given.
+
+    `cost_state` lets a caller (main.py's _run_pipeline) share one running-total
+    accumulator across multiple phases (recon -> debate -> build in codebase mode) so
+    the frontend's cumulative cost display doesn't reset between phases. Defaults to a
+    fresh [0.0] for headless/standalone callers that only ever run this one phase.
     """
-    text, cost, truncated = await _run_recon_turn(bus, sandbox_dir=sandbox_dir, description=description)
+    if cost_state is None:
+        cost_state = [0.0]
+    text, _cost, truncated = await _run_recon_turn(
+        bus, sandbox_dir=sandbox_dir, description=description, cost_state=cost_state
+    )
 
     result = {
         "sandbox_dir": sandbox_dir,
         "context_path": None,
         "context_text": "",
-        "total_cost_usd": cost,
+        "total_cost_usd": cost_state[0],
         "ok": text is not None,
         "truncated": truncated,
     }
@@ -114,7 +141,9 @@ async def run_recon(
             "Debate from the description alone."
         )
 
-    bus.emit(AgentEvent(type="phase_done", phase="recon", content=json.dumps(result)))
+    bus.emit(
+        AgentEvent(type="phase_done", phase="recon", content=json.dumps(result), cost_usd=cost_state[0])
+    )
     return result
 
 

@@ -7,72 +7,155 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <header id="run-form">
-    <h1>Multi-Agent Debate &amp; Build Pipeline</h1>
-    <div class="form-row">
-      <label for="mode-select">Mode</label>
-      <select id="mode-select">
-        <option value="full">Full (debate + build)</option>
-        <option value="debate_only">Debate only (spec, no code)</option>
-        <option value="build_only">Build only (paste a spec)</option>
-        <option value="codebase">Codebase (patch an existing project)</option>
-      </select>
-    </div>
-    <div class="form-row" id="target-path-row" hidden>
-      <label for="target-path">Target path</label>
-      <input type="text" id="target-path" placeholder="C:\path\to\existing\project -- read-only, never written to">
-    </div>
-    <div class="form-row" id="idea-row">
-      <textarea id="idea" rows="2" placeholder="Describe a project idea, e.g. a CLI tool that renames photos by EXIF date"></textarea>
-    </div>
-    <div class="form-row" id="spec-row" hidden>
-      <textarea id="spec-text" rows="6" placeholder="Paste your own spec/schema here -- the build agents (Architect/Coder/Reviewer/Tester) use it as-is, no debate phase runs."></textarea>
-    </div>
-    <div class="form-row" id="rounds-row">
-      <label for="rounds">Debate rounds</label>
-      <input type="number" id="rounds" min="1" max="8" value="3">
-    </div>
-    <div class="form-row">
-      <button id="run-btn" type="button">Run</button>
-      <button id="cancel-btn" type="button" hidden>Cancel</button>
-    </div>
-    <div class="form-row" id="model-row">
-      <label for="model-select">Model</label>
-      <select id="model-select">
-        <option value="">Default</option>
-      </select>
-      <span id="model-status" class="model-status"></span>
-      <label for="effort-slider">Effort</label>
-      <input type="range" id="effort-slider" min="0" max="5" step="1" value="0">
-      <span id="effort-label">Default</span>
-    </div>
-    <p id="run-error" class="error-banner" hidden></p>
-    <p id="paused-banner" class="paused-banner" hidden></p>
-  </header>
+  <div class="page">
 
-  <div id="progress-bar">
-    <div id="progress-fill"></div>
-    <span id="progress-label">Idle</span>
+    <header class="topbar">
+      <div class="wordmark">
+        <span class="eyebrow">Multi-Agent Pipeline</span>
+        <h1>Debate &amp; Build</h1>
+      </div>
+      <div class="run-status" id="run-status">
+        <span class="dot" id="run-dot" aria-hidden="true"></span>
+        <span>Run <span class="id-chip" id="run-id-chip">&mdash;</span> &middot; <span id="run-phase-label">Idle</span></span>
+        <span class="cost-tag" id="cost-tag">$0.00</span>
+      </div>
+    </header>
+
+    <section class="config-strip">
+      <button class="config-toggle" id="config-toggle" type="button" aria-expanded="true" aria-controls="config-panel">
+        <span class="config-toggle-left"><span class="chevron">&rsaquo;</span> Run Configuration</span>
+        <span class="config-summary" id="config-summary">
+          <span class="chip">Mode: Full</span>
+          <span class="chip">Rounds: 3</span>
+          <span class="chip">Model: Default</span>
+          <span class="chip">Effort: Default</span>
+        </span>
+      </button>
+      <div class="config-panel" id="config-panel">
+        <div class="config-field span-2">
+          <span class="field-label">Mode</span>
+          <div class="pill-group" data-group="mode">
+            <button type="button" class="pill selected" data-value="full">Full</button>
+            <button type="button" class="pill" data-value="debate_only">Debate Only</button>
+            <button type="button" class="pill" data-value="build_only">Build Only</button>
+            <button type="button" class="pill" data-value="codebase">Codebase</button>
+          </div>
+          <select id="mode-select" class="legacy-control" aria-hidden="true" tabindex="-1">
+            <option value="full">Full (debate + build)</option>
+            <option value="debate_only">Debate only (spec, no code)</option>
+            <option value="build_only">Build only (paste a spec)</option>
+            <option value="codebase">Codebase (patch an existing project)</option>
+          </select>
+        </div>
+
+        <div class="config-field span-2" id="target-path-row" hidden>
+          <span class="field-label">Target Path</span>
+          <input type="text" id="target-path" placeholder="C:\path\to\existing\project -- read-only, never written to">
+        </div>
+
+        <div class="config-field span-2" id="idea-row">
+          <span class="field-label">Idea</span>
+          <textarea id="idea" rows="2" placeholder="Describe a project idea, e.g. a CLI tool that renames photos by EXIF date"></textarea>
+        </div>
+
+        <div class="config-field span-2" id="spec-row" hidden>
+          <span class="field-label">Spec</span>
+          <textarea id="spec-text" class="mono" rows="6" placeholder="Paste your own spec/schema here -- the build agents (Architect/Coder/Reviewer/Tester) use it as-is, no debate phase runs."></textarea>
+        </div>
+
+        <div class="config-field" id="rounds-row">
+          <span class="field-label">Debate Rounds</span>
+          <input type="number" id="rounds" min="1" max="8" value="3">
+        </div>
+
+        <div class="config-field">
+          <span class="field-label">Model</span>
+          <div class="pill-group" data-group="model">
+            <button type="button" class="pill selected" data-value="">Default</button>
+            <button type="button" class="pill" data-value="sonnet">Sonnet</button>
+            <button type="button" class="pill" data-value="opus">Opus</button>
+            <button type="button" class="pill" data-value="haiku">Haiku</button>
+            <button type="button" class="pill" data-value="fable">Fable</button>
+          </div>
+          <span id="model-status" class="model-status"></span>
+          <select id="model-select" class="legacy-control" aria-hidden="true" tabindex="-1">
+            <option value="">Default</option>
+          </select>
+        </div>
+
+        <div class="config-field span-2">
+          <span class="field-label">Effort</span>
+          <div class="pill-group" data-group="effort">
+            <button type="button" class="pill selected" data-value="">Default</button>
+            <button type="button" class="pill" data-value="low">Low</button>
+            <button type="button" class="pill" data-value="medium">Medium</button>
+            <button type="button" class="pill" data-value="high">High</button>
+            <button type="button" class="pill" data-value="xhigh">X-High</button>
+            <button type="button" class="pill" data-value="max">Max</button>
+          </div>
+          <input type="range" id="effort-slider" class="legacy-control" aria-hidden="true" tabindex="-1" min="0" max="5" step="1" value="0">
+          <span id="effort-label" class="legacy-control" aria-hidden="true">Default</span>
+        </div>
+
+        <div class="config-field span-2 config-actions">
+          <button id="run-btn" class="btn btn-primary" type="button">Run</button>
+          <button id="cancel-btn" class="btn btn-ghost" type="button" hidden>Cancel</button>
+        </div>
+
+        <p id="run-error" class="error-banner config-field span-2" hidden></p>
+        <p id="paused-banner" class="paused-banner config-field span-2" hidden></p>
+      </div>
+    </section>
+
+    <div id="progress-bar" class="legacy-control" aria-hidden="true">
+      <div id="progress-fill"></div>
+      <span id="progress-label">Idle</span>
+    </div>
+
+    <section class="tracker" aria-label="Pipeline progress">
+      <ol class="tracker-list" id="tracker-list">
+        <li class="step" hidden data-step="Sandbox" data-phase="sandbox"><span class="node"></span>Sandbox</li>
+        <li class="step" hidden data-step="Recon" data-phase="recon"><span class="node"></span>Recon</li>
+        <li class="step" data-step="Strategist" data-phase="debate"><span class="node"></span>Strategist</li>
+        <li class="step" data-step="Critic" data-phase="debate"><span class="node"></span>Critic</li>
+        <li class="step" data-step="Refiner" data-phase="debate"><span class="node"></span>Refiner</li>
+        <li class="step-sep" id="rounds-sep">&times;3 Rounds</li>
+        <li class="step" data-step="Architect" data-phase="build"><span class="node"></span>Architect</li>
+        <li class="step" data-step="Coder" data-phase="build"><span class="node"></span>Coder</li>
+        <li class="step" data-step="Reviewer" data-phase="build"><span class="node"></span>Reviewer</li>
+        <li class="step" data-step="Tester" data-phase="build"><span class="node"></span>Tester</li>
+      </ol>
+    </section>
+
+    <main class="feeds" id="feeds">
+      <section class="feed" id="debate-feed" aria-labelledby="debate-feed-title">
+        <div class="feed-head">
+          <h2 id="debate-feed-title">Debate</h2>
+          <span class="feed-meta" id="debate-feed-meta">Idle</span>
+        </div>
+        <div class="feed-body"></div>
+      </section>
+      <section class="feed" id="build-feed" aria-labelledby="build-feed-title">
+        <div class="feed-head">
+          <h2 id="build-feed-title">Build</h2>
+          <span class="feed-meta" id="build-feed-meta">Idle</span>
+        </div>
+        <div class="feed-body"></div>
+      </section>
+    </main>
+
+    <section class="output-panel">
+      <div class="feed-head">
+        <h2>Output Files</h2>
+        <span class="feed-meta" id="file-count">0 Files</span>
+      </div>
+      <div class="output-body">
+        <ul id="file-list"></ul>
+        <pre id="file-view">Select a file to view its contents.</pre>
+      </div>
+    </section>
+
   </div>
-
-  <main id="feeds">
-    <section id="debate-feed" class="feed">
-      <h2 id="debate-feed-title">Debate</h2>
-      <div class="feed-body"></div>
-    </section>
-    <section id="build-feed" class="feed">
-      <h2>Build</h2>
-      <div class="feed-body"></div>
-    </section>
-  </main>
-
-  <section id="output-panel">
-    <h2>Output Files</h2>
-    <div id="output-body">
-      <ul id="file-list"></ul>
-      <pre id="file-view">Select a file to view its contents.</pre>
-    </div>
-  </section>
 
   <script src="/static/app.js" defer></script>
 </body>

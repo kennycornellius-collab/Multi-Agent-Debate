@@ -167,6 +167,10 @@ async def _run_pipeline(state: RunState) -> None:
     # state.errors for run_done's content would race the watcher and could embed a
     # stale/incomplete value. fatal_error is only ever set synchronously, right here.
     fatal_error: Optional[str] = None
+    # Shared across every phase this run touches (recon/debate/build) so the frontend's
+    # cumulative cost display (agent_done/error/phase_done's cost_usd field) keeps
+    # accruing across phase boundaries instead of resetting to 0 when build starts.
+    cost_state: list[float] = [0.0]
     try:
         if state.mode == "build_only":
             # No debate call at all -- the user's own spec_text stands in for what the
@@ -175,7 +179,13 @@ async def _run_pipeline(state: RunState) -> None:
             out_dir = Path(config.OUTPUT_DIR) / state.run_id
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "agreed_spec.md").write_text(state.spec_text, encoding="utf-8")
-            await run_build(run_id=state.run_id, bus=state.bus, model=state.model, effort=state.effort)
+            await run_build(
+                run_id=state.run_id,
+                bus=state.bus,
+                model=state.model,
+                effort=state.effort,
+                cost_state=cost_state,
+            )
         elif state.mode == "codebase":
             # Codebase Analysis Mode (SPEC.md addon): chain Stage 7 (sandbox) -> Stage 8
             # (Recon) -> Stage 9 (debate with Critic's read-only sandbox access) -> Stage
@@ -202,6 +212,7 @@ async def _run_pipeline(state: RunState) -> None:
                     description=state.idea,
                     bus=state.bus,
                     output_dir=str(out_dir),
+                    cost_state=cost_state,
                 )
                 # run_recon() never raises and always returns a usable context_text (a
                 # graceful fallback note on failure) -- no "did Recon succeed" branching
@@ -217,6 +228,7 @@ async def _run_pipeline(state: RunState) -> None:
                     model=state.model,
                     effort=state.effort,
                     sandbox_dir=sandbox_dir,
+                    cost_state=cost_state,
                 )
                 if debate_result.get("agreed_spec_path"):
                     await run_build(
@@ -226,6 +238,7 @@ async def _run_pipeline(state: RunState) -> None:
                         effort=state.effort,
                         target_mode=True,
                         diff_available=diff_available,
+                        cost_state=cost_state,
                     )
                 else:
                     fatal_error = "Debate phase ended without an agreed spec; build phase skipped."
@@ -237,11 +250,16 @@ async def _run_pipeline(state: RunState) -> None:
                 run_id=state.run_id,
                 model=state.model,
                 effort=state.effort,
+                cost_state=cost_state,
             )
             if state.mode == "full":
                 if debate_result.get("agreed_spec_path"):
                     await run_build(
-                        run_id=state.run_id, bus=state.bus, model=state.model, effort=state.effort
+                        run_id=state.run_id,
+                        bus=state.bus,
+                        model=state.model,
+                        effort=state.effort,
+                        cost_state=cost_state,
                     )
                 else:
                     fatal_error = "Debate phase ended without an agreed spec; build phase skipped."

@@ -83,6 +83,7 @@ async def _run_turn(
     instruction: str,
     phase: str,
     round: Optional[int],
+    cost_state: list[float],
     mode: Literal["text_only", "read_only"] = "text_only",
     cwd: Optional[str] = None,
     timeout: Optional[int] = None,
@@ -100,7 +101,13 @@ async def _run_turn(
     The third element of the return tuple is `truncated`: True if the CLI hit its
     turn limit but had already produced usable output (see agents/runner.py) -- mirrors
     build.py's _run_step, so a truncated debate turn is surfaced the same way a
-    truncated build step is, instead of being silently treated as a clean finish."""
+    truncated build step is, instead of being silently treated as a clean finish.
+
+    `cost_state` is a single-element list shared across the whole run (potentially
+    across recon/debate/build phases -- see main.py's _run_pipeline), mutated in place
+    so this turn's cost is folded into the running total *before* agent_done/error is
+    emitted -- that's what lets the frontend show a live cumulative cost per event
+    instead of only learning the total at the very end of the run."""
     for attempt in (1, 2):
         bus.emit(AgentEvent(type="agent_start", phase=phase, round=round, agent=agent))
         try:
@@ -132,14 +139,28 @@ async def _run_turn(
                     full_text = event.content
                     cost_usd = event.cost_usd or 0.0
                     truncated = event.truncated
+            cost_state[0] += cost_usd
             done_content = "hit the turn limit; using the output produced so far" if truncated else ""
-            bus.emit(AgentEvent(type="agent_done", phase=phase, round=round, agent=agent, content=done_content))
+            bus.emit(
+                AgentEvent(
+                    type="agent_done",
+                    phase=phase,
+                    round=round,
+                    agent=agent,
+                    content=done_content,
+                    cost_usd=cost_state[0],
+                )
+            )
             return full_text, cost_usd, truncated
         except AgentError as e:
             if attempt == 1:
                 continue
             tail = str(e).strip()[-500:]
-            bus.emit(AgentEvent(type="error", phase=phase, round=round, agent=agent, content=tail))
+            bus.emit(
+                AgentEvent(
+                    type="error", phase=phase, round=round, agent=agent, content=tail, cost_usd=cost_state[0]
+                )
+            )
             return None, 0.0, False
 
     return None, 0.0, False  # unreachable, keeps type checkers happy
@@ -155,6 +176,7 @@ async def run_debate(
     model: Optional[str] = None,
     effort: Optional[str] = None,
     sandbox_dir: Optional[str] = None,
+    cost_state: Optional[list[float]] = None,
 ) -> dict:
     """Run the full debate loop + final synthesis. Returns a summary dict; always writes
     debate_log.json, and writes agreed_spec.md only if the final synthesis succeeded.
@@ -170,14 +192,20 @@ async def run_debate(
     (especially Recon's) against the real files instead of only arguing from the
     transcript. Strategist and Refiner are unaffected. The codebase context itself is
     expected to already be folded into `idea` by the caller (e.g. Recon's digest) --
-    run_debate() doesn't know or care where `idea` came from."""
+    run_debate() doesn't know or care where `idea` came from.
+
+    `cost_state` lets a caller (main.py's _run_pipeline) share one running-total
+    accumulator across multiple phases (e.g. recon -> debate -> build in codebase mode)
+    so the frontend's cumulative cost display doesn't reset between phases. Defaults to
+    a fresh [0.0] for headless/standalone callers that only ever run this one phase."""
     num_rounds = max(1, min(num_rounds, config.MAX_DEBATE_ROUNDS))
     out_dir = Path(output_dir) if output_dir else Path(config.OUTPUT_DIR) / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
+    if cost_state is None:
+        cost_state = [0.0]
 
     history: list[dict] = []
     summary = ""
-    total_cost = 0.0
     warnings: list[str] = []
 
     for r in range(1, num_rounds + 1):
@@ -203,7 +231,7 @@ async def run_debate(
                     "against the real files before critiquing. Cite file path + line for "
                     "anything you confirm or refute."
                 )
-            text, cost, truncated = await _run_turn(
+            text, _cost, truncated = await _run_turn(
                 bus,
                 agent=name,
                 system_prompt_file=prompt_file,
@@ -211,13 +239,13 @@ async def run_debate(
                 instruction=instruction,
                 phase="debate",
                 round=r,
+                cost_state=cost_state,
                 mode=agent_mode,
                 cwd=agent_cwd,
                 timeout=agent_timeout,
                 model=model,
                 effort=effort,
             )
-            total_cost += cost
             if truncated:
                 warnings.append(f"{name} (round {r}) hit the turn limit; using the output produced so far.")
             if text is not None:
@@ -241,7 +269,7 @@ async def run_debate(
         )
     final_stdin = render_transcript(idea, history, current_round=1, summary=summary)  # force full
 
-    final_text, final_cost, final_truncated = await _run_turn(
+    final_text, _final_cost, final_truncated = await _run_turn(
         bus,
         agent="Refiner",
         system_prompt_file="debate/refiner.txt",
@@ -249,11 +277,11 @@ async def run_debate(
         instruction=final_instruction,
         phase="debate",
         round=None,
+        cost_state=cost_state,
         timeout=config.DEBATE_TIMEOUT,
         model=model,
         effort=effort,
     )
-    total_cost += final_cost
     if final_truncated:
         warnings.append("Refiner (final synthesis) hit the turn limit; using the output produced so far.")
 
@@ -267,7 +295,7 @@ async def run_debate(
         "idea": idea,
         "num_rounds": num_rounds,
         "history": history,
-        "total_cost_usd": total_cost,
+        "total_cost_usd": cost_state[0],
         "warnings": warnings,
     }
     (out_dir / "debate_log.json").write_text(json.dumps(debate_log, indent=2), encoding="utf-8")
@@ -279,10 +307,11 @@ async def run_debate(
             content=json.dumps(
                 {
                     "agreed_spec_path": str(agreed_spec_path) if agreed_spec_path else None,
-                    "total_cost_usd": total_cost,
+                    "total_cost_usd": cost_state[0],
                     "warnings": warnings,
                 }
             ),
+            cost_usd=cost_state[0],
         )
     )
 
@@ -291,7 +320,7 @@ async def run_debate(
         "output_dir": str(out_dir),
         "agreed_spec_path": str(agreed_spec_path) if agreed_spec_path else None,
         "history": history,
-        "total_cost_usd": total_cost,
+        "total_cost_usd": cost_state[0],
         "warnings": warnings,
     }
 

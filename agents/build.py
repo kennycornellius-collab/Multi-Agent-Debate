@@ -73,6 +73,7 @@ async def _run_step(
     stdin_text: str,
     instruction: str,
     mode: str,
+    cost_state: list[float],
     cwd: Optional[str] = None,
     timeout: Optional[int] = None,
     model: Optional[str] = None,
@@ -85,7 +86,12 @@ async def _run_step(
 
     The third element of the return tuple is `truncated`: True if the CLI hit its
     turn limit but had already produced usable output (see agents/runner.py) -- the
-    step is treated as complete, but the caller may want to flag it as a warning."""
+    step is treated as complete, but the caller may want to flag it as a warning.
+
+    `cost_state` is a single-element list shared across the whole run (potentially
+    across recon/debate/build phases -- see main.py's _run_pipeline), mutated in place
+    so this step's cost is folded into the running total before agent_done/error is
+    emitted -- see debate.py's _run_turn for the identical rationale."""
     for attempt in (1, 2):
         bus.emit(AgentEvent(type="agent_start", phase="build", agent=agent))
         try:
@@ -116,14 +122,25 @@ async def _run_step(
                     full_text = event.content
                     cost_usd = event.cost_usd or 0.0
                     truncated = event.truncated
+            cost_state[0] += cost_usd
             done_content = "hit the turn limit; using the output produced so far" if truncated else ""
-            bus.emit(AgentEvent(type="agent_done", phase="build", agent=agent, content=done_content))
+            bus.emit(
+                AgentEvent(
+                    type="agent_done",
+                    phase="build",
+                    agent=agent,
+                    content=done_content,
+                    cost_usd=cost_state[0],
+                )
+            )
             return full_text, cost_usd, truncated
         except AgentError as e:
             if attempt == 1:
                 continue
             tail = str(e).strip()[-500:]
-            bus.emit(AgentEvent(type="error", phase="build", agent=agent, content=tail))
+            bus.emit(
+                AgentEvent(type="error", phase="build", agent=agent, content=tail, cost_usd=cost_state[0])
+            )
             return None, 0.0, False
 
     return None, 0.0, False  # unreachable, keeps type checkers happy
@@ -138,6 +155,7 @@ async def run_build(
     effort: Optional[str] = None,
     target_mode: bool = False,
     diff_available: bool = False,
+    cost_state: Optional[list[float]] = None,
 ) -> dict:
     """Run the full build pipeline against an existing debate run. Returns a summary dict.
 
@@ -161,12 +179,19 @@ async def run_build(
     call) picks the change-detection mechanism: a real `git diff` against the sandbox's
     baseline commit when True, or a before/after file-hash comparison when False (no git
     on PATH) -- the latter can still tell what changed, it just can't produce patch.diff.
-    Ignored when target_mode is False."""
+    Ignored when target_mode is False.
+
+    `cost_state` lets a caller (main.py's _run_pipeline) share one running-total
+    accumulator across multiple phases (e.g. debate -> build) so the frontend's
+    cumulative cost display doesn't reset between phases. Defaults to a fresh [0.0]
+    for headless/standalone callers that only ever run this one phase."""
     out_dir = Path(output_dir) if output_dir else Path(config.OUTPUT_DIR) / run_id
     spec_path = out_dir / "agreed_spec.md"
     if not spec_path.is_file():
         raise AgentError(f"agreed_spec.md not found at {spec_path} -- run the debate phase first")
     spec_text = spec_path.read_text(encoding="utf-8")
+    if cost_state is None:
+        cost_state = [0.0]
 
     result = {
         "run_id": run_id,
@@ -180,7 +205,6 @@ async def run_build(
         "total_cost_usd": 0.0,
         "warnings": [],
     }
-    total_cost = 0.0
 
     # --- Architect ---
     arch_prompt_file, arch_mode, arch_timeout = config.BUILD_AGENTS["Architect"]
@@ -188,19 +212,19 @@ async def run_build(
         "Read the agreed spec on stdin and produce the architecture document now, "
         "following your role and output-format rules exactly."
     )
-    arch_text, arch_cost, arch_truncated = await _run_step(
+    arch_text, _arch_cost, arch_truncated = await _run_step(
         bus,
         agent="Architect",
         system_prompt_file=arch_prompt_file,
         stdin_text=spec_text,
         instruction=arch_instruction,
         mode=arch_mode,
+        cost_state=cost_state,
         timeout=arch_timeout,
         model=model,
         effort=effort,
     )
-    total_cost += arch_cost
-    result["total_cost_usd"] = total_cost
+    result["total_cost_usd"] = cost_state[0]
     if arch_truncated:
         result["warnings"].append("Architect hit the turn limit; using the output produced so far.")
 
@@ -210,6 +234,7 @@ async def run_build(
                 type="phase_done",
                 phase="build",
                 content=json.dumps({**result, "reason": "architect_failed"}),
+                cost_usd=cost_state[0],
             )
         )
         return result
@@ -256,20 +281,20 @@ async def run_build(
             "directly in the current working directory following the File Tree and Build Order. "
             "Follow your stdout-format rules exactly."
         )
-    _, coder_cost, coder_truncated = await _run_step(
+    _, _coder_cost, coder_truncated = await _run_step(
         bus,
         agent="Coder",
         system_prompt_file=coder_prompt_file,
         stdin_text=coder_stdin,
         instruction=coder_instruction,
         mode=coder_mode,
+        cost_state=cost_state,
         cwd=str(build_dir),
         timeout=coder_timeout,
         model=model,
         effort=effort,
     )
-    total_cost += coder_cost
-    result["total_cost_usd"] = total_cost
+    result["total_cost_usd"] = cost_state[0]
     if coder_truncated:
         result["warnings"].append("Coder hit the turn limit; using the output produced so far.")
 
@@ -295,12 +320,15 @@ async def run_build(
             if target_mode
             else "Coder produced no files in build/; skipping Reviewer and Tester."
         )
-        bus.emit(AgentEvent(type="error", phase="build", agent="Coder", content=message))
+        bus.emit(
+            AgentEvent(type="error", phase="build", agent="Coder", content=message, cost_usd=cost_state[0])
+        )
         bus.emit(
             AgentEvent(
                 type="phase_done",
                 phase="build",
                 content=json.dumps({**result, "reason": reason}),
+                cost_usd=cost_state[0],
             )
         )
         return result
@@ -313,20 +341,20 @@ async def run_build(
         "Read the agreed spec on stdin and the code in the current working directory, "
         "then produce the review document now, following your output-format rules exactly."
     )
-    review_text, review_cost, review_truncated = await _run_step(
+    review_text, _review_cost, review_truncated = await _run_step(
         bus,
         agent="Reviewer",
         system_prompt_file=reviewer_prompt_file,
         stdin_text=spec_text,
         instruction=reviewer_instruction,
         mode=reviewer_mode,
+        cost_state=cost_state,
         cwd=str(build_dir),
         timeout=reviewer_timeout,
         model=model,
         effort=effort,
     )
-    total_cost += review_cost
-    result["total_cost_usd"] = total_cost
+    result["total_cost_usd"] = cost_state[0]
     if review_truncated:
         result["warnings"].append("Reviewer hit the turn limit; using the output produced so far.")
 
@@ -352,20 +380,20 @@ async def run_build(
         "code in the current working directory, then create the test files directly and "
         "follow your stdout-format rules exactly."
     )
-    tests_text, tester_cost, tester_truncated = await _run_step(
+    tests_text, _tester_cost, tester_truncated = await _run_step(
         bus,
         agent="Tester",
         system_prompt_file=tester_prompt_file,
         stdin_text=tester_stdin,
         instruction=tester_instruction,
         mode=tester_mode,
+        cost_state=cost_state,
         cwd=str(build_dir),
         timeout=tester_timeout,
         model=model,
         effort=effort,
     )
-    total_cost += tester_cost
-    result["total_cost_usd"] = total_cost
+    result["total_cost_usd"] = cost_state[0]
     if tester_truncated:
         result["warnings"].append("Tester hit the turn limit; using the output produced so far.")
 
@@ -397,7 +425,9 @@ async def run_build(
         bus.emit(
             AgentEvent(type="files_updated", phase="build", content=json.dumps(_walk_build_dir(build_dir)))
         )
-    bus.emit(AgentEvent(type="phase_done", phase="build", content=json.dumps(result)))
+    bus.emit(
+        AgentEvent(type="phase_done", phase="build", content=json.dumps(result), cost_usd=cost_state[0])
+    )
 
     return result
 

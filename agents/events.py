@@ -7,7 +7,11 @@ list first, then stream live events off the queue.
 Field naming note: the text payload is always carried in `content` (not
 `text`) so it matches the SSE event schema in SPEC.md verbatim -- Stage 4's
 `GET /stream/{run_id}` can `json.dumps(event.to_dict())` with zero
-translation. The `result` event additionally carries `cost_usd`.
+translation. The `result` event additionally carries `cost_usd`; so do
+`agent_done`, `error`, and `phase_done` (a running total-so-far for the whole
+pipeline run, not just that one call -- see debate.py/build.py/recon.py's
+`cost_state` accumulator), which is what lets the frontend show a live
+cumulative cost without any new event type or field.
 """
 
 from __future__ import annotations
@@ -31,7 +35,9 @@ class AgentEvent:
     agent: agent name (e.g. "Strategist") or "system"
     content: meaning depends on `type` (delta text, error message, file
              listing JSON, full result text, human-readable pause reason, ...)
-    cost_usd: populated on `result` events when the CLI reports a cost
+    cost_usd: populated on `result` events when the CLI reports a cost, and on
+              `agent_done`/`error`/`phase_done` as the pipeline's running total
+              cost so far (see debate.py/build.py/recon.py)
     truncated: on a `result` event, True if the CLI hit its turn limit before
                finishing (subtype "error_max_turns") but had already produced
                usable output -- see agents/runner.py. False for a clean finish.
