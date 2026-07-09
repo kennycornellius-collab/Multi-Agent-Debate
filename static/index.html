@@ -25,10 +25,10 @@
       <button class="config-toggle" id="config-toggle" type="button" aria-expanded="true" aria-controls="config-panel">
         <span class="config-toggle-left"><span class="chevron">&rsaquo;</span> Run Configuration</span>
         <span class="config-summary" id="config-summary">
-          <span class="chip">Mode: Full</span>
-          <span class="chip">Rounds: 3</span>
-          <span class="chip">Model: Default</span>
-          <span class="chip">Effort: Default</span>
+          <span class="chip" id="chip-mode">Mode: Full</span>
+          <span class="chip" id="chip-rounds">Rounds: 3</span>
+          <span class="chip" id="chip-model">Model: Default</span>
+          <span class="chip" id="chip-effort">Effort: Default</span>
         </span>
       </button>
       <div class="config-panel" id="config-panel">
@@ -40,12 +40,6 @@
             <button type="button" class="pill" data-value="build_only">Build Only</button>
             <button type="button" class="pill" data-value="codebase">Codebase</button>
           </div>
-          <select id="mode-select" class="legacy-control" aria-hidden="true" tabindex="-1">
-            <option value="full">Full (debate + build)</option>
-            <option value="debate_only">Debate only (spec, no code)</option>
-            <option value="build_only">Build only (paste a spec)</option>
-            <option value="codebase">Codebase (patch an existing project)</option>
-          </select>
         </div>
 
         <div class="config-field span-2" id="target-path-row" hidden>
@@ -78,9 +72,6 @@
             <button type="button" class="pill" data-value="fable">Fable</button>
           </div>
           <span id="model-status" class="model-status"></span>
-          <select id="model-select" class="legacy-control" aria-hidden="true" tabindex="-1">
-            <option value="">Default</option>
-          </select>
         </div>
 
         <div class="config-field span-2">
@@ -93,24 +84,17 @@
             <button type="button" class="pill" data-value="xhigh">X-High</button>
             <button type="button" class="pill" data-value="max">Max</button>
           </div>
-          <input type="range" id="effort-slider" class="legacy-control" aria-hidden="true" tabindex="-1" min="0" max="5" step="1" value="0">
-          <span id="effort-label" class="legacy-control" aria-hidden="true">Default</span>
         </div>
 
-        <div class="config-field span-2 config-actions">
-          <button id="run-btn" class="btn btn-primary" type="button">Run</button>
-          <button id="cancel-btn" class="btn btn-ghost" type="button" hidden>Cancel</button>
-        </div>
-
-        <p id="run-error" class="error-banner config-field span-2" hidden></p>
-        <p id="paused-banner" class="paused-banner config-field span-2" hidden></p>
+      </div>
+      <div class="config-actions">
+        <button id="run-btn" class="btn btn-primary" type="button">Run</button>
+        <button id="cancel-btn" class="btn btn-ghost" type="button" hidden>Cancel</button>
       </div>
     </section>
 
-    <div id="progress-bar" class="legacy-control" aria-hidden="true">
-      <div id="progress-fill"></div>
-      <span id="progress-label">Idle</span>
-    </div>
+    <p id="run-error" class="error-banner" hidden></p>
+    <p id="paused-banner" class="paused-banner" hidden></p>
 
     <section class="tracker" aria-label="Pipeline progress">
       <ol class="tracker-list" id="tracker-list">

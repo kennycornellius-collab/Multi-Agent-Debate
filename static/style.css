@@ -58,12 +58,6 @@
   --coder: #c05a1f; --reviewer: #157a72; --tester: #9c7d12; --recon: #5b6472;
 }
 
-/* Stage 12 scaffolding only: the real #mode-select/#model-select/#effort-slider/
-   #effort-label controls stay in the DOM (so app.js's existing queries/bindings don't
-   throw) but are visually superseded by the pill-groups above them. Stage 13 wires the
-   pills to real state and removes these entirely. */
-.legacy-control { display: none; }
-
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
 body {
@@ -129,7 +123,9 @@ h1, h2 { margin: 0; }
 .pill:hover { color: var(--text); border-color: var(--accent); }
 .pill.selected { background: var(--accent-tint); border-color: var(--accent); color: var(--accent); }
 .pill:disabled { opacity: 0.4; cursor: not-allowed; }
-.config-actions { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+/* Always visible regardless of .config-panel's collapsed state -- Run/Cancel must stay
+   reachable while a run is active, which is exactly when the panel auto-collapses. */
+.config-actions { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; padding: 0.75rem 1rem; border-top: 1px solid var(--border); }
 .btn { font: inherit; font-size: 0.8rem; font-weight: 700; padding: 0.55rem 1.2rem; border-radius: 5px; border: 1px solid transparent; cursor: pointer; letter-spacing: 0.01em; }
 .btn-primary { background: var(--accent); color: var(--accent-text); }
 .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
@@ -197,6 +193,7 @@ h1, h2 { margin: 0; }
 .round-pill { font-family: var(--font-mono); background: var(--surface); border: 1px solid var(--border); border-radius: 99px; padding: 0.03rem 0.5rem; color: var(--text-muted); font-size: 0.68rem; }
 .card-status { margin-left: auto; color: var(--text-muted); font-size: 0.72rem; font-weight: 600; display: flex; align-items: center; gap: 0.35rem; }
 .card-body { font-size: 0.87rem; line-height: 1.55; white-space: pre-wrap; }
+.card-body.dim { color: var(--text-muted); font-size: 0.8rem; }
 .cursor { display: inline-block; width: 0.5em; height: 1em; background: var(--active); vertical-align: text-bottom; margin-left: 1px; }
 @media (prefers-reduced-motion: no-preference) { .cursor { animation: blink 1s step-end infinite; } }
 @keyframes blink { 50% { opacity: 0; } }
@@ -218,6 +215,8 @@ h1, h2 { margin: 0; }
 .card.paused .card-status { color: var(--standby); }
 
 .synthesis { border-color: var(--accent); background: var(--accent-tint); }
+.card.synthesis .led { background: var(--accent); }
+.card.synthesis .agent-tag { color: var(--accent); }
 
 /* ---------- Output panel ---------- */
 .output-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 0.9rem; display: flex; flex-direction: column; gap: 0.65rem; }

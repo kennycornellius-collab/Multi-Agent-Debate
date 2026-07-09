@@ -3,11 +3,11 @@
 
   const STORAGE_KEY = "debate-pipeline-run";
   const BUILD_ORDER = ["Architect", "Coder", "Reviewer", "Tester"];
+  const DEBATE_ORDER = ["Strategist", "Critic", "Refiner"];
   const FILE_PRIORITY = ["agreed_spec.md", "architecture.md", "review.md", "tests.md"];
   const SCROLL_BOTTOM_THRESHOLD = 40;
   const MODEL_CHECK_DEBOUNCE_MS = 400;
 
-  const modeSelect = document.getElementById("mode-select");
   const ideaRow = document.getElementById("idea-row");
   const specRow = document.getElementById("spec-row");
   const roundsRow = document.getElementById("rounds-row");
@@ -17,53 +17,156 @@
   const targetPathInput = document.getElementById("target-path");
   const roundsInput = document.getElementById("rounds");
   const debateFeedTitle = document.getElementById("debate-feed-title");
+  const debateFeedMetaEl = document.getElementById("debate-feed-meta");
+  const buildFeedMetaEl = document.getElementById("build-feed-meta");
   const runBtn = document.getElementById("run-btn");
   const cancelBtn = document.getElementById("cancel-btn");
   const runErrorEl = document.getElementById("run-error");
   const pausedBannerEl = document.getElementById("paused-banner");
-  const modelSelect = document.getElementById("model-select");
   const modelStatusEl = document.getElementById("model-status");
-  const effortSlider = document.getElementById("effort-slider");
-  const effortLabelEl = document.getElementById("effort-label");
-  const progressFill = document.getElementById("progress-fill");
-  const progressLabel = document.getElementById("progress-label");
   const debateFeedSection = document.getElementById("debate-feed");
   const buildFeedSection = document.getElementById("build-feed");
   const debateFeedBody = document.querySelector("#debate-feed .feed-body");
   const buildFeedBody = document.querySelector("#build-feed .feed-body");
   const fileListEl = document.getElementById("file-list");
   const fileViewEl = document.getElementById("file-view");
+  const fileCountEl = document.getElementById("file-count");
+  const runDotEl = document.getElementById("run-dot");
+  const runIdChipEl = document.getElementById("run-id-chip");
+  const runPhaseLabelEl = document.getElementById("run-phase-label");
+  const costTagEl = document.getElementById("cost-tag");
+  const configToggleEl = document.getElementById("config-toggle");
+  const configPanelEl = document.getElementById("config-panel");
+  const chipModeEl = document.getElementById("chip-mode");
+  const chipRoundsEl = document.getElementById("chip-rounds");
+  const chipModelEl = document.getElementById("chip-model");
+  const chipEffortEl = document.getElementById("chip-effort");
+  const trackerListEl = document.getElementById("tracker-list");
+  const roundsSepEl = document.getElementById("rounds-sep");
 
   const state = {
     runId: null,
     numRounds: 3,
     mode: "full",
     eventSource: null,
-    cards: new Map(), // key -> { el, body, status }
+    cards: new Map(), // key -> { el, head, status, body }
+    activeCard: null, // the one card currently marked .active/.bracket, if any
     selectedFile: null,
-    // effortChoices[0] is always "" (Default); effortChoices[i] for i>0 is a real
-    // --effort value, in the order config.py's AVAILABLE_EFFORT_LEVELS lists them.
-    effortChoices: [""],
+    totalCost: 0,
     modelCheckSeq: 0, // guards against a stale check response overwriting a newer one
   };
 
-  // Progress-bar fraction ranges per mode: "full" keeps the original 0-0.5 debate /
-  // 0.5-1 build split; the single-phase modes get the whole 0-1 bar to themselves.
-  function progressSpan() {
-    if (state.mode === "debate_only") return { debateStart: 0, debateEnd: 1, buildStart: 1, buildEnd: 1 };
-    if (state.mode === "build_only") return { debateStart: 0, debateEnd: 0, buildStart: 0, buildEnd: 1 };
-    return { debateStart: 0, debateEnd: 0.5, buildStart: 0.5, buildEnd: 1 };
+  function clamp(n, lo, hi) {
+    return Math.max(lo, Math.min(hi, n));
+  }
+
+  function capitalize(s) {
+    return s.charAt(0).toUpperCase() + s.slice(1);
+  }
+
+  // config.py's AVAILABLE_MODELS/AVAILABLE_EFFORT_LEVELS are plain lowercase CLI values;
+  // "xhigh" is the one irregular case that a naive capitalize() can't produce correctly.
+  function formatValueLabel(value) {
+    if (value === "xhigh") return "X-High";
+    return capitalize(value);
+  }
+
+  // ---------- Pill groups (Mode / Model / Effort) ----------
+
+  function getPillGroup(name) {
+    return document.querySelector(`.pill-group[data-group="${name}"]`);
+  }
+
+  function getSelectedPill(name) {
+    const group = getPillGroup(name);
+    return group ? group.querySelector(".pill.selected") : null;
+  }
+
+  function getSelectedPillValue(name) {
+    const pill = getSelectedPill(name);
+    return pill ? pill.dataset.value : "";
+  }
+
+  function getSelectedPillLabel(name) {
+    const pill = getSelectedPill(name);
+    return pill ? pill.textContent : "";
+  }
+
+  function selectPill(name, value) {
+    const group = getPillGroup(name);
+    if (!group) return;
+    for (const p of group.querySelectorAll(".pill")) {
+      p.classList.toggle("selected", p.dataset.value === value);
+    }
+  }
+
+  function makePill(value, label, selected) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `pill${selected ? " selected" : ""}`;
+    btn.dataset.value = value;
+    btn.textContent = label;
+    return btn;
+  }
+
+  // Rebuilds a pill-group's options from a fetched config list, always keeping "Default"
+  // (value "") first. Preserves whatever was selected before the rebuild when possible --
+  // the hardcoded fallback pills already in index.html match config.py's current values,
+  // so in the common case this is a no-op refresh, not a visible change.
+  function rebuildValuePills(name, values) {
+    const group = getPillGroup(name);
+    if (!group) return;
+    const previous = getSelectedPillValue(name);
+    group.replaceChildren(makePill("", "Default", previous === ""));
+    for (const value of values) {
+      group.appendChild(makePill(value, formatValueLabel(value), value === previous));
+    }
+  }
+
+  function wirePillGroup(name, onChange) {
+    const group = getPillGroup(name);
+    if (!group) return;
+    group.addEventListener("click", (e) => {
+      const btn = e.target.closest(".pill");
+      if (!btn) return;
+      selectPill(name, btn.dataset.value);
+      onChange(btn.dataset.value);
+    });
+  }
+
+  // ---------- Config strip (collapse/expand + summary chips) ----------
+
+  function setConfigCollapsed(collapsed) {
+    configToggleEl.setAttribute("aria-expanded", String(!collapsed));
+    configPanelEl.hidden = collapsed;
+  }
+
+  function updateConfigSummary() {
+    const rounds = roundsInput.value || "3";
+    chipModeEl.textContent = `Mode: ${getSelectedPillLabel("mode") || "Full"}`;
+    chipRoundsEl.textContent = `Rounds: ${rounds}`;
+    chipModelEl.textContent = `Model: ${getSelectedPillLabel("model") || "Default"}`;
+    chipEffortEl.textContent = `Effort: ${getSelectedPillLabel("effort") || "Default"}`;
+    roundsSepEl.textContent = `×${rounds} Rounds`;
+  }
+
+  // ---------- Mode-driven visibility (form fields, feeds, tracker steps) ----------
+
+  function setStepHidden(key, hidden) {
+    const li = trackerListEl.querySelector(`[data-step="${CSS.escape(key)}"]`);
+    if (li) li.hidden = hidden;
   }
 
   function applyModeVisibility(mode) {
     const isBuildOnly = mode === "build_only";
+    const isDebateOnly = mode === "debate_only";
     const isCodebase = mode === "codebase";
     ideaRow.hidden = isBuildOnly;
     specRow.hidden = !isBuildOnly;
     roundsRow.hidden = isBuildOnly;
     targetPathRow.hidden = !isCodebase;
     debateFeedSection.hidden = isBuildOnly;
-    buildFeedSection.hidden = mode === "debate_only";
+    buildFeedSection.hidden = isDebateOnly;
     ideaInput.placeholder = isCodebase
       ? "Describe the bug or feature to investigate, e.g. add(2, 3) returns -1 instead of 5"
       : "Describe a project idea, e.g. a CLI tool that renames photos by EXIF date";
@@ -71,10 +174,12 @@
     // see feedBodyFor() -- so its heading should reflect that instead of implying only
     // debate cards ever show up there.
     debateFeedTitle.textContent = isCodebase ? "Investigation & Debate" : "Debate";
-  }
 
-  function clamp(n, lo, hi) {
-    return Math.max(lo, Math.min(hi, n));
+    setStepHidden("Sandbox", !isCodebase);
+    setStepHidden("Recon", !isCodebase);
+    for (const key of DEBATE_ORDER) setStepHidden(key, isBuildOnly);
+    roundsSepEl.hidden = isBuildOnly;
+    for (const key of BUILD_ORDER) setStepHidden(key, isDebateOnly);
   }
 
   function showError(msg) {
@@ -106,11 +211,6 @@
     return /cancelled/i.test(content) ? "Cancelled" : "Finished with errors";
   }
 
-  function setProgress(fraction, label) {
-    progressFill.style.width = `${clamp(fraction, 0, 1) * 100}%`;
-    progressLabel.textContent = label;
-  }
-
   function persistRun(runId, numRounds, mode) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ runId, numRounds, mode }));
   }
@@ -119,37 +219,17 @@
     localStorage.removeItem(STORAGE_KEY);
   }
 
-  function capitalize(s) {
-    return s.charAt(0).toUpperCase() + s.slice(1);
-  }
-
-  function currentEffort() {
-    return state.effortChoices[parseInt(effortSlider.value, 10)] || "";
-  }
-
-  function updateEffortLabel() {
-    const effort = currentEffort();
-    effortLabelEl.textContent = effort ? capitalize(effort) : "Default";
-  }
-
   async function loadUiConfig() {
     try {
       const res = await fetch("/config");
       if (!res.ok) return;
       const data = await res.json();
-      for (const model of data.models || []) {
-        const opt = document.createElement("option");
-        opt.value = model;
-        opt.textContent = capitalize(model);
-        modelSelect.appendChild(opt);
-      }
-      state.effortChoices = ["", ...(data.effort_levels || [])];
-      effortSlider.max = String(state.effortChoices.length - 1);
+      rebuildValuePills("model", data.models || []);
+      rebuildValuePills("effort", data.effort_levels || []);
     } catch {
-      // /config unreachable: dropdown just stays at "Default" and the slider covers
-      // only the Default position -- run() still works, just without overrides.
+      // /config unreachable: the hardcoded fallback pills already in index.html stay as-is.
     }
-    updateEffortLabel();
+    updateConfigSummary();
   }
 
   function setModelStatus(text, cls) {
@@ -160,7 +240,7 @@
   let modelCheckTimer = null;
 
   function scheduleModelCheck() {
-    const model = modelSelect.value;
+    const model = getSelectedPillValue("model");
     clearTimeout(modelCheckTimer);
     if (!model) {
       setModelStatus("", "");
@@ -178,7 +258,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model }),
       });
-      if (seq !== state.modelCheckSeq || modelSelect.value !== model) return; // stale
+      if (seq !== state.modelCheckSeq || getSelectedPillValue("model") !== model) return; // stale
       if (!res.ok) {
         setModelStatus((await safeDetail(res)) || `check failed (${res.status})`, "unavailable");
         return;
@@ -190,7 +270,7 @@
         setModelStatus(`✗ ${data.message || "not available"}`, "unavailable");
       }
     } catch (err) {
-      if (seq !== state.modelCheckSeq || modelSelect.value !== model) return;
+      if (seq !== state.modelCheckSeq || getSelectedPillValue("model") !== model) return;
       setModelStatus(`network error: ${err.message}`, "unavailable");
     }
   }
@@ -213,78 +293,150 @@
     if (atBottom) container.scrollTop = container.scrollHeight;
   }
 
+  // Marks `card` as the one actively-streaming card (corner-bracket highlight). At most
+  // one card is ever truly live at a time (the pipeline runs one agent turn at a time),
+  // so promoting a new one always demotes whichever was previously active.
+  function setActiveCard(card) {
+    if (state.activeCard && state.activeCard !== card) {
+      state.activeCard.el.classList.remove("active", "bracket");
+    }
+    state.activeCard = card || null;
+    if (card) card.el.classList.add("active", "bracket");
+  }
+
+  // dot: "active" (amber, pulsing) while streaming, "success" (green) when done, or
+  // omitted entirely for error/paused/queued -- mirrors the mockup's own convention of
+  // only pairing a status dot with Streaming/Done, plain text otherwise.
+  function setCardStatus(card, text, dotKind) {
+    card.status.replaceChildren();
+    if (dotKind) {
+      const dot = document.createElement("span");
+      dot.className = dotKind === "active" ? "dot active pulse" : `dot ${dotKind}`;
+      card.status.appendChild(dot);
+    }
+    card.status.appendChild(document.createTextNode(text));
+  }
+
   function getOrCreateCard(ev) {
     const key = cardKey(ev);
     let card = state.cards.get(key);
     if (card) return card;
 
+    const isSynthesis = ev.phase === "debate" && ev.agent === "Refiner" && ev.round == null;
     const el = document.createElement("div");
-    el.className = `card agent-${(ev.agent || "system").toLowerCase()}`;
+    el.className = `card agent-${(ev.agent || "system").toLowerCase()}${isSynthesis ? " synthesis" : ""}`;
 
-    const header = document.createElement("div");
-    header.className = "card-header";
+    const head = document.createElement("div");
+    head.className = "card-head";
 
-    const nameSpan = document.createElement("span");
-    nameSpan.textContent = ev.agent || "system";
+    const led = document.createElement("span");
+    led.className = "led";
+
+    const tag = document.createElement("span");
+    tag.className = "agent-tag";
+    tag.textContent = ev.agent || "system";
+
+    head.appendChild(led);
+    head.appendChild(tag);
+
     if (ev.phase === "debate") {
-      const roundSpan = document.createElement("span");
-      roundSpan.className = "card-round";
-      roundSpan.textContent = ev.round == null ? " · final synthesis" : ` · round ${ev.round}`;
-      nameSpan.appendChild(roundSpan);
+      const roundPill = document.createElement("span");
+      roundPill.className = "round-pill";
+      roundPill.textContent = ev.round == null ? "Final Synthesis" : `R${ev.round}`;
+      head.appendChild(roundPill);
     }
 
-    const statusSpan = document.createElement("span");
-    statusSpan.className = "card-status";
-    statusSpan.textContent = "streaming…";
-
-    header.appendChild(nameSpan);
-    header.appendChild(statusSpan);
+    const status = document.createElement("span");
+    status.className = "card-status";
+    head.appendChild(status);
 
     const body = document.createElement("div");
     body.className = "card-body";
 
-    el.appendChild(header);
+    el.appendChild(head);
     el.appendChild(body);
 
     const container = feedBodyFor(ev.phase);
     withAutoScroll(container, () => container.appendChild(el));
 
-    card = { el, body, status: statusSpan };
+    card = { el, head, status, body };
     state.cards.set(key, card);
+    setCardStatus(card, "Streaming", "active");
+    setActiveCard(card);
     return card;
   }
 
-  function updateProgress(ev) {
-    const { debateStart, debateEnd, buildStart, buildEnd } = progressSpan();
-    if (ev.type === "run_done") {
-      setProgress(1, runDoneLabel(ev.content));
-      return;
+  // ---------- Tracker + topbar + feed-meta (the step-state/cost/phase-label HUD) ----------
+
+  function stepKeyFor(ev) {
+    if (ev.phase === "sandbox") return "Sandbox";
+    if (ev.phase === "recon") return "Recon";
+    if (ev.phase === "debate" || ev.phase === "build") return ev.agent;
+    return null;
+  }
+
+  function setStepState(key, cls) {
+    if (!key) return;
+    const li = trackerListEl.querySelector(`[data-step="${CSS.escape(key)}"]`);
+    if (!li) return;
+    li.classList.remove("done", "active");
+    if (cls) li.classList.add(cls);
+  }
+
+  function resetTracker() {
+    for (const li of trackerListEl.querySelectorAll(".step")) {
+      li.classList.remove("done", "active");
     }
-    if (ev.type === "phase_done") {
-      if (ev.phase === "debate") setProgress(debateEnd, debateEnd >= 1 ? "Done" : "Build starting…");
-      else if (ev.phase === "build") setProgress(buildEnd, "Build complete");
-      return;
-    }
-    if (ev.type !== "agent_start") return;
-    if (ev.phase === "sandbox") {
-      setProgress(0, "Preparing sandbox…");
-    } else if (ev.phase === "recon") {
-      setProgress(0.02, "Investigating codebase (Recon)…");
-    } else if (ev.phase === "debate") {
-      const n = state.numRounds || 3;
-      const within = ev.round == null ? 1 : (ev.round - 1) / n;
-      setProgress(
-        debateStart + (debateEnd - debateStart) * Math.min(within, 1),
-        ev.round == null ? `Debate — final synthesis (${ev.agent})` : `Debate — round ${ev.round}/${n}: ${ev.agent}`
-      );
-    } else if (ev.phase === "build") {
-      const idx = BUILD_ORDER.indexOf(ev.agent);
-      const within = idx === -1 ? 0 : idx / BUILD_ORDER.length;
-      setProgress(buildStart + (buildEnd - buildStart) * within, `Build — ${ev.agent}`);
+  }
+
+  function updateCost(ev) {
+    if (ev.cost_usd == null) return;
+    state.totalCost = ev.cost_usd;
+    costTagEl.textContent = `$${state.totalCost.toFixed(4)}`;
+  }
+
+  function updateHud(ev) {
+    updateCost(ev);
+    if (ev.type === "agent_start") {
+      setStepState(stepKeyFor(ev), "active");
+      runDotEl.className = "dot active pulse";
+      if (ev.phase === "sandbox") {
+        runPhaseLabelEl.textContent = "Preparing sandbox…";
+      } else if (ev.phase === "recon") {
+        runPhaseLabelEl.textContent = "Investigating codebase (Recon)…";
+        debateFeedMetaEl.textContent = "Recon";
+      } else if (ev.phase === "debate") {
+        const n = state.numRounds || 3;
+        const roundLabel = ev.round == null ? "Final synthesis" : `Round ${ev.round} of ${n}`;
+        runPhaseLabelEl.textContent = `Debate · ${roundLabel} · ${ev.agent}`;
+        debateFeedMetaEl.textContent = roundLabel;
+      } else if (ev.phase === "build") {
+        const idx = BUILD_ORDER.indexOf(ev.agent);
+        buildFeedMetaEl.textContent = idx === -1 ? ev.agent : `Step ${idx + 1} of ${BUILD_ORDER.length} · ${ev.agent}`;
+        runPhaseLabelEl.textContent = `Build · ${ev.agent}`;
+      }
+    } else if (ev.type === "agent_done" || ev.type === "error") {
+      setStepState(stepKeyFor(ev), "done");
+    } else if (ev.type === "phase_done") {
+      if (ev.phase === "sandbox") {
+        setStepState("Sandbox", "done");
+      } else if (ev.phase === "recon") {
+        setStepState("Recon", "done");
+      } else if (ev.phase === "debate") {
+        for (const key of DEBATE_ORDER) setStepState(key, "done");
+        debateFeedMetaEl.textContent = "Done";
+      } else if (ev.phase === "build") {
+        for (const key of BUILD_ORDER) setStepState(key, "done");
+        buildFeedMetaEl.textContent = "Done";
+      }
+    } else if (ev.type === "run_done") {
+      runPhaseLabelEl.textContent = runDoneLabel(ev.content);
+      runDotEl.className = ev.content ? "dot error" : "dot success";
     }
   }
 
   function handleEvent(ev) {
+    updateHud(ev);
     switch (ev.type) {
       case "agent_start": {
         const key = cardKey(ev);
@@ -296,10 +448,11 @@
           // clear it so the retry's own output doesn't get concatenated onto the stale
           // fragment left behind by the failed attempt.
           card.body.textContent = "";
-          card.status.textContent = "streaming…";
-          card.el.classList.remove("error");
+          card.body.classList.remove("dim");
+          card.el.classList.remove("error", "compact");
+          setCardStatus(card, "Streaming", "active");
+          setActiveCard(card);
         }
-        updateProgress(ev);
         break;
       }
       case "delta": {
@@ -312,14 +465,19 @@
       }
       case "agent_done": {
         const card = getOrCreateCard(ev);
-        card.status.textContent = ev.content ? `done (${ev.content})` : "done";
+        card.el.classList.add("compact");
+        card.body.classList.add("dim");
+        setCardStatus(card, ev.content ? `Done (${ev.content})` : "Done", "success");
+        if (state.activeCard === card) setActiveCard(null);
         break;
       }
       case "error": {
         const card = getOrCreateCard(ev);
-        card.el.classList.add("error");
-        card.status.textContent = "error";
+        card.el.classList.add("error", "compact");
+        card.body.classList.add("dim");
+        setCardStatus(card, "Error");
         if (ev.content) card.body.textContent += `\n[error] ${ev.content}`;
+        if (state.activeCard === card) setActiveCard(null);
         break;
       }
       case "paused": {
@@ -327,10 +485,13 @@
         // exhaustion and will retry the identical call once it's over -- not a failure,
         // so no ".error" class here, just a distinct waiting state + the global banner.
         const card = getOrCreateCard(ev);
-        card.el.classList.add("paused");
-        card.status.textContent = ev.retry_at
-          ? `waiting — resumes ~${new Date(ev.retry_at).toLocaleString()}`
-          : "waiting — usage limit reached";
+        card.el.classList.add("paused", "compact");
+        card.body.classList.add("dim");
+        setCardStatus(
+          card,
+          ev.retry_at ? `Paused · resumes ~${new Date(ev.retry_at).toLocaleString()}` : "Paused · waiting"
+        );
+        if (state.activeCard === card) setActiveCard(null);
         showPaused(ev.retry_at);
         break;
       }
@@ -341,8 +502,10 @@
         // agent_start retry-clear branch above).
         const card = getOrCreateCard(ev);
         card.body.textContent = "";
-        card.status.textContent = "streaming…";
-        card.el.classList.remove("paused");
+        card.body.classList.remove("dim");
+        card.el.classList.remove("paused", "compact");
+        setCardStatus(card, "Streaming", "active");
+        setActiveCard(card);
         hidePaused();
         break;
       }
@@ -350,11 +513,9 @@
         refreshFiles();
         break;
       case "phase_done":
-        updateProgress(ev);
         refreshFiles();
         break;
       case "run_done":
-        updateProgress(ev);
         finishRun(ev.content);
         break;
       default:
@@ -385,6 +546,7 @@
     }
     runBtn.disabled = false;
     cancelBtn.hidden = true;
+    setConfigCollapsed(false);
     hidePaused();
     clearPersistedRun();
     if (content) showError(content);
@@ -410,10 +572,16 @@
     debateFeedBody.replaceChildren();
     buildFeedBody.replaceChildren();
     state.cards.clear();
+    state.activeCard = null;
     fileListEl.replaceChildren();
     fileViewEl.textContent = "Select a file to view its contents.";
+    fileCountEl.textContent = "0 Files";
     state.selectedFile = null;
-    setProgress(0, "Starting…");
+    state.totalCost = 0;
+    costTagEl.textContent = "$0.00";
+    resetTracker();
+    debateFeedMetaEl.textContent = "Idle";
+    buildFeedMetaEl.textContent = "Idle";
   }
 
   async function safeDetail(res) {
@@ -427,7 +595,7 @@
 
   async function startRun() {
     hideError();
-    const mode = modeSelect.value;
+    const mode = getSelectedPillValue("mode");
     let idea = "";
     let specText = "";
     let targetPath = "";
@@ -452,8 +620,8 @@
       }
     }
     const numRounds = clamp(parseInt(roundsInput.value, 10) || 3, 1, 8);
-    const model = modelSelect.value || null;
-    const effort = currentEffort() || null;
+    const model = getSelectedPillValue("model") || null;
+    const effort = getSelectedPillValue("effort") || null;
 
     runBtn.disabled = true;
     try {
@@ -481,8 +649,13 @@
       applyModeVisibility(mode);
       resetFeeds();
       hidePaused();
+      setConfigCollapsed(true);
       cancelBtn.hidden = false;
       state.numRounds = numRounds;
+      runIdChipEl.textContent = data.run_id;
+      runPhaseLabelEl.textContent = "Starting…";
+      runDotEl.className = "dot active pulse";
+      if (mode === "codebase") setStepState("Sandbox", "active"); // sandbox prep emits no agent_start (SPEC.md: plain code, zero agent calls)
       persistRun(data.run_id, numRounds, mode);
       connect(data.run_id);
     } catch (err) {
@@ -528,7 +701,9 @@
 
   function renderFileList(files) {
     fileListEl.replaceChildren();
-    for (const path of sortFiles(files)) {
+    const sorted = sortFiles(files);
+    fileCountEl.textContent = `${sorted.length} File${sorted.length === 1 ? "" : "s"}`;
+    for (const path of sorted) {
       const li = document.createElement("li");
       li.textContent = path;
       li.dataset.path = path;
@@ -581,17 +756,27 @@
     state.runId = runId;
     state.numRounds = numRounds || 3;
     state.mode = mode || "full";
-    modeSelect.value = state.mode;
+    selectPill("mode", state.mode);
     applyModeVisibility(state.mode);
+    updateConfigSummary();
     runBtn.disabled = !!status.running;
     cancelBtn.hidden = !status.running;
+    runIdChipEl.textContent = runId;
+    // The SSE replay buffer (connect() below) re-delivers every historical event for
+    // this run, and handleEvent()/updateHud() rebuild the tracker/cards/cost-tag from
+    // that replay for free -- no separate "reconstruct state from /status" logic needed,
+    // same reasoning as the pre-Stage-13 progress bar.
     connect(runId);
     if (status.running) {
-      setProgress(0, "Recovering…");
+      setConfigCollapsed(true);
+      runPhaseLabelEl.textContent = "Recovering…";
+      runDotEl.className = "dot active pulse";
       if (status.paused) showPaused(status.paused_until);
     } else {
       refreshFiles();
-      setProgress(1, runDoneLabel(status.error));
+      setConfigCollapsed(false);
+      runPhaseLabelEl.textContent = runDoneLabel(status.error);
+      runDotEl.className = status.error ? "dot error" : "dot success";
       clearPersistedRun();
     }
     if (status.error) showError(status.error);
@@ -599,11 +784,21 @@
 
   runBtn.addEventListener("click", startRun);
   cancelBtn.addEventListener("click", cancelRun);
-  modelSelect.addEventListener("change", scheduleModelCheck);
-  effortSlider.addEventListener("input", updateEffortLabel);
-  modeSelect.addEventListener("change", () => applyModeVisibility(modeSelect.value));
+  roundsInput.addEventListener("input", updateConfigSummary);
+  configToggleEl.addEventListener("click", () => {
+    setConfigCollapsed(configToggleEl.getAttribute("aria-expanded") === "true");
+  });
+  wirePillGroup("mode", (value) => {
+    applyModeVisibility(value);
+    updateConfigSummary();
+  });
+  wirePillGroup("model", () => {
+    scheduleModelCheck();
+    updateConfigSummary();
+  });
+  wirePillGroup("effort", updateConfigSummary);
   window.addEventListener("DOMContentLoaded", () => {
-    applyModeVisibility(modeSelect.value);
+    applyModeVisibility(getSelectedPillValue("mode"));
     loadUiConfig();
     tryRecoverRun();
   });
