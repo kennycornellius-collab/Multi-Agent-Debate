@@ -9,6 +9,7 @@ ARCHITECT_TIMEOUT = 300
 CODER_TIMEOUT = 900           # writes a whole project; needs headroom
 REVIEWER_TIMEOUT = 600
 TESTER_TIMEOUT = 600
+BUGFIXER_TIMEOUT = 600
 
 # CLI guards
 DEBATE_MODEL = None           # None = CLI default; can set e.g. a cheaper model name
@@ -59,6 +60,10 @@ BUILD_AGENTS = {
     "Coder": ("build/coder.txt", "builder", CODER_TIMEOUT),
     "Reviewer": ("build/reviewer.txt", "builder", REVIEWER_TIMEOUT),
     "Tester": ("build/tester.txt", "builder", TESTER_TIMEOUT),
+    # Stage 15: only ever run when allow_exec is True (agents/build.py's run_build()) --
+    # not part of the default four-step pipeline, so it's looked up directly rather than
+    # iterated over generically the way the other four entries conceptually are.
+    "BugFixer": ("build/bugfixer.txt", "builder_exec", BUGFIXER_TIMEOUT),
 }
 
 # Test Execution addon (SPEC.md v6), Stage 14. Tester runs in "builder_exec" mode
@@ -67,6 +72,11 @@ BUILD_AGENTS = {
 # Separate turn budget from BUILD_MAX_TURNS: write tests + exactly one test-command run,
 # not a write-heavy multi-file session.
 TESTER_MAX_TURNS = 40
+
+# Stage 15: BugFixer's own turn budget -- fix + exactly one verification re-run of the
+# test command, same rationale as TESTER_MAX_TURNS above (not a write-heavy multi-file
+# session, and never an iteration loop).
+BUGFIXER_MAX_TURNS = 40
 
 # Confirmed empirically against the installed CLI (three real, separate mechanisms, not
 # one -- see SPEC.md's Test Execution addon for the full trail):

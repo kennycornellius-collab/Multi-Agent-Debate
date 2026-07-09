@@ -43,11 +43,14 @@
   const chipEffortEl = document.getElementById("chip-effort");
   const trackerListEl = document.getElementById("tracker-list");
   const roundsSepEl = document.getElementById("rounds-sep");
+  const allowExecCheckbox = document.getElementById("allow-exec");
+  const allowExecWarningEl = document.getElementById("allow-exec-warning");
 
   const state = {
     runId: null,
     numRounds: 3,
     mode: "full",
+    allowExec: false, // Test Execution addon: whether this run's BugFixer step can run at all
     eventSource: null,
     cards: new Map(), // key -> { el, head, status, body }
     activeCard: null, // the one card currently marked .active/.bracket, if any
@@ -157,6 +160,21 @@
     if (li) li.hidden = hidden;
   }
 
+  // Test Execution addon: BugFixer's tracker node is hidden whenever the debate-only
+  // mode already hides every build step, OR the checkbox is unchecked -- unlike the
+  // other four build steps, it doesn't run by default even when build steps are visible.
+  function updateBugFixerVisibility() {
+    const isDebateOnly = getSelectedPillValue("mode") === "debate_only";
+    setStepHidden("BugFixer", isDebateOnly || !allowExecCheckbox.checked);
+  }
+
+  // Only meaningful in Codebase mode, where "execute the generated code" actually means
+  // "execute code from the analyzed target_path", not just this pipeline's own output.
+  function updateAllowExecWarning() {
+    const isCodebase = getSelectedPillValue("mode") === "codebase";
+    allowExecWarningEl.hidden = !(isCodebase && allowExecCheckbox.checked);
+  }
+
   function applyModeVisibility(mode) {
     const isBuildOnly = mode === "build_only";
     const isDebateOnly = mode === "debate_only";
@@ -180,6 +198,8 @@
     for (const key of DEBATE_ORDER) setStepHidden(key, isBuildOnly);
     roundsSepEl.hidden = isBuildOnly;
     for (const key of BUILD_ORDER) setStepHidden(key, isDebateOnly);
+    updateBugFixerVisibility();
+    updateAllowExecWarning();
   }
 
   function showError(msg) {
@@ -211,8 +231,8 @@
     return /cancelled/i.test(content) ? "Cancelled" : "Finished with errors";
   }
 
-  function persistRun(runId, numRounds, mode) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ runId, numRounds, mode }));
+  function persistRun(runId, numRounds, mode, allowExec) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ runId, numRounds, mode, allowExec }));
   }
 
   function clearPersistedRun() {
@@ -395,6 +415,15 @@
     costTagEl.textContent = `$${state.totalCost.toFixed(4)}`;
   }
 
+  // Test Execution addon: BugFixer only ever runs when this run opted in, so it's kept
+  // out of the base BUILD_ORDER constant (which drives debate_only's mode-hide loop
+  // above, where it should never appear) and instead appended here, per-run, so the
+  // "Step X of Y" label and the phase_done completion sweep both reflect whether this
+  // particular run actually has a fifth step or not.
+  function activeBuildOrder() {
+    return state.allowExec ? [...BUILD_ORDER, "BugFixer"] : BUILD_ORDER;
+  }
+
   function updateHud(ev) {
     updateCost(ev);
     if (ev.type === "agent_start") {
@@ -411,8 +440,9 @@
         runPhaseLabelEl.textContent = `Debate · ${roundLabel} · ${ev.agent}`;
         debateFeedMetaEl.textContent = roundLabel;
       } else if (ev.phase === "build") {
-        const idx = BUILD_ORDER.indexOf(ev.agent);
-        buildFeedMetaEl.textContent = idx === -1 ? ev.agent : `Step ${idx + 1} of ${BUILD_ORDER.length} · ${ev.agent}`;
+        const order = activeBuildOrder();
+        const idx = order.indexOf(ev.agent);
+        buildFeedMetaEl.textContent = idx === -1 ? ev.agent : `Step ${idx + 1} of ${order.length} · ${ev.agent}`;
         runPhaseLabelEl.textContent = `Build · ${ev.agent}`;
       }
     } else if (ev.type === "agent_done" || ev.type === "error") {
@@ -426,7 +456,7 @@
         for (const key of DEBATE_ORDER) setStepState(key, "done");
         debateFeedMetaEl.textContent = "Done";
       } else if (ev.phase === "build") {
-        for (const key of BUILD_ORDER) setStepState(key, "done");
+        for (const key of activeBuildOrder()) setStepState(key, "done");
         buildFeedMetaEl.textContent = "Done";
       }
     } else if (ev.type === "run_done") {
@@ -622,6 +652,7 @@
     const numRounds = clamp(parseInt(roundsInput.value, 10) || 3, 1, 8);
     const model = getSelectedPillValue("model") || null;
     const effort = getSelectedPillValue("effort") || null;
+    const allowExec = allowExecCheckbox.checked;
 
     runBtn.disabled = true;
     try {
@@ -637,6 +668,7 @@
           model,
           effort,
           mode,
+          allow_test_execution: allowExec,
         }),
       });
       if (!res.ok) {
@@ -652,11 +684,12 @@
       setConfigCollapsed(true);
       cancelBtn.hidden = false;
       state.numRounds = numRounds;
+      state.allowExec = allowExec;
       runIdChipEl.textContent = data.run_id;
       runPhaseLabelEl.textContent = "Starting…";
       runDotEl.className = "dot active pulse";
       if (mode === "codebase") setStepState("Sandbox", "active"); // sandbox prep emits no agent_start (SPEC.md: plain code, zero agent calls)
-      persistRun(data.run_id, numRounds, mode);
+      persistRun(data.run_id, numRounds, mode, allowExec);
       connect(data.run_id);
     } catch (err) {
       showError(`Network error starting run: ${err.message}`);
@@ -735,7 +768,7 @@
       clearPersistedRun();
       return;
     }
-    const { runId, numRounds, mode } = saved || {};
+    const { runId, numRounds, mode, allowExec } = saved || {};
     if (!runId) {
       clearPersistedRun();
       return;
@@ -756,6 +789,8 @@
     state.runId = runId;
     state.numRounds = numRounds || 3;
     state.mode = mode || "full";
+    state.allowExec = !!allowExec;
+    allowExecCheckbox.checked = !!allowExec;
     selectPill("mode", state.mode);
     applyModeVisibility(state.mode);
     updateConfigSummary();
@@ -797,6 +832,10 @@
     updateConfigSummary();
   });
   wirePillGroup("effort", updateConfigSummary);
+  allowExecCheckbox.addEventListener("change", () => {
+    updateBugFixerVisibility();
+    updateAllowExecWarning();
+  });
   window.addEventListener("DOMContentLoaded", () => {
     applyModeVisibility(getSelectedPillValue("mode"));
     loadUiConfig();

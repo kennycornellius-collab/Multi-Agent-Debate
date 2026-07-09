@@ -10,7 +10,7 @@
   --queued: #8a93a3;
 
   --strategist: #2f6fd1; --critic: #cf3c4c; --refiner: #1f8f57; --architect: #7a4fd6;
-  --coder: #c05a1f; --reviewer: #157a72; --tester: #9c7d12; --recon: #5b6472;
+  --coder: #c05a1f; --reviewer: #157a72; --tester: #9c7d12; --recon: #5b6472; --bugfixer: #a8452e;
 
   --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --font-mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, "Roboto Mono", monospace;
@@ -27,7 +27,7 @@
     --standby: #8c7bf0; --standby-tint: rgba(140,123,240,0.14);
     --queued: #4a5568;
     --strategist: #5b9eea; --critic: #ea6470; --refiner: #3fc98a; --architect: #a98af0;
-    --coder: #f0975a; --reviewer: #2ba89c; --tester: #d9b23c; --recon: #8891a0;
+    --coder: #f0975a; --reviewer: #2ba89c; --tester: #d9b23c; --recon: #8891a0; --bugfixer: #e08866;
   }
 }
 
@@ -43,7 +43,7 @@
   --standby: #8c7bf0; --standby-tint: rgba(140,123,240,0.14);
   --queued: #4a5568;
   --strategist: #5b9eea; --critic: #ea6470; --refiner: #3fc98a; --architect: #a98af0;
-  --coder: #f0975a; --reviewer: #2ba89c; --tester: #d9b23c; --recon: #8891a0;
+  --coder: #f0975a; --reviewer: #2ba89c; --tester: #d9b23c; --recon: #8891a0; --bugfixer: #e08866;
 }
 :root[data-theme="light"] {
   --bg: #eef1f6; --grid-line: rgba(16,20,28,0.05); --surface: #ffffff; --surface-2: #f4f6fa;
@@ -55,7 +55,7 @@
   --standby: #6c58d9; --standby-tint: rgba(108,88,217,0.10);
   --queued: #8a93a3;
   --strategist: #2f6fd1; --critic: #cf3c4c; --refiner: #1f8f57; --architect: #7a4fd6;
-  --coder: #c05a1f; --reviewer: #157a72; --tester: #9c7d12; --recon: #5b6472;
+  --coder: #c05a1f; --reviewer: #157a72; --tester: #9c7d12; --recon: #5b6472; --bugfixer: #a8452e;
 }
 
 * { box-sizing: border-box; }
@@ -136,6 +136,9 @@ h1, h2 { margin: 0; }
 .model-status.available { color: var(--success); }
 .model-status.unavailable { color: var(--danger); }
 
+.checkbox-row { display: flex; align-items: center; gap: 0.5rem; font-family: var(--font-ui); font-size: 0.85rem; color: var(--text); }
+.warning-note { font-family: var(--font-ui); font-size: 0.78rem; color: var(--danger); margin: 0; }
+
 .error-banner {
   background: var(--danger-tint); color: var(--danger); border: 1px solid var(--danger);
   padding: 0.55rem 0.8rem; border-radius: 6px; margin: 0; font-size: 0.85rem;
@@ -209,6 +212,7 @@ h1, h2 { margin: 0; }
 .card.agent-reviewer .led { background: var(--reviewer); } .card.agent-reviewer .agent-tag { color: var(--reviewer); }
 .card.agent-tester .led { background: var(--tester); } .card.agent-tester .agent-tag { color: var(--tester); }
 .card.agent-recon .led { background: var(--recon); } .card.agent-recon .agent-tag { color: var(--recon); }
+.card.agent-bugfixer .led { background: var(--bugfixer); } .card.agent-bugfixer .agent-tag { color: var(--bugfixer); }
 .card.agent-system .led { background: var(--text-muted); } .card.agent-system .agent-tag { color: var(--text-muted); }
 
 .card.error { background: var(--surface); border-color: var(--danger); }

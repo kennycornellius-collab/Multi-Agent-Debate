@@ -23,21 +23,24 @@ import config
 from agents.events import AgentEvent, EventBus
 from agents.runner import AgentError, run_agent_streaming
 
+# Matches both Tester's "## Run Results" and BugFixer's "## Re-run Results" (Stage 15) --
+# same PASSED/FAILED/ERRORS body shape in both, so one shared parser covers tests.md and
+# bugfix.md alike.
 _RUN_RESULTS_RE = re.compile(
-    r"##\s*Run Results\s*\n+PASSED:\s*(\d+),\s*FAILED:\s*(\d+),\s*ERRORS:\s*(\d+)",
+    r"##\s*(?:Run|Re-run) Results\s*\n+PASSED:\s*(\d+),\s*FAILED:\s*(\d+),\s*ERRORS:\s*(\d+)",
     re.IGNORECASE,
 )
 
 
-def _parse_test_results(tests_text: Optional[str]) -> tuple[Optional[bool], Optional[str]]:
-    """Best-effort extraction of Tester's '## Run Results' section (Test Execution addon,
-    only populated when allow_exec=True) into (tests_passed, test_summary). Returns
-    (None, None) when the section is missing/unparseable -- e.g. allow_exec=False, Tester
-    reported "Could not execute", or Tester's stdout didn't follow the format -- rather
-    than raising. This is a display convenience, not a strict contract on Tester's output."""
-    if not tests_text:
+def _parse_test_results(text: Optional[str]) -> tuple[Optional[bool], Optional[str]]:
+    """Best-effort extraction of a '## Run Results' / '## Re-run Results' section (Test
+    Execution addon, only populated when allow_exec=True) into (tests_passed,
+    test_summary). Returns (None, None) when the section is missing/unparseable -- e.g.
+    allow_exec=False, "Could not execute", "Not re-run", or output that didn't follow the
+    format -- rather than raising. This is a display convenience, not a strict contract."""
+    if not text:
         return None, None
-    match = _RUN_RESULTS_RE.search(tests_text)
+    match = _RUN_RESULTS_RE.search(text)
     if not match:
         return None, None
     passed, failed, errors = (int(x) for x in match.groups())
@@ -215,10 +218,16 @@ async def run_build(
     the Tester runs in "builder_exec" mode (agents/runner.py) instead of plain "builder"
     and actually invokes the test command it documents, once, recording real PASSED/
     FAILED/ERRORS counts in tests.md's new Run Results section (parsed into this
-    function's result dict as tests_passed/test_summary, best-effort). When False (the
-    default, and every run before this addon), behavior is unchanged: Tester never gets
-    a Bash tool, tests.md's Run Results section reports "Could not execute", and
-    tests_passed/test_summary come back None."""
+    function's result dict as tests_passed/test_summary, best-effort); a BugFixer step
+    (Stage 15) then runs immediately after, once, fixing what Tester's Run Results showed
+    as actually failing and re-running the same test command once more to verify,
+    recording bugfix_path and refreshing tests_passed/test_summary from its own re-run
+    when it did anything. Neither step iterates -- one bounded extra pass, not a loop back
+    to Coder. When False (the default, and every run before this addon), behavior is
+    unchanged: Tester never gets a Bash tool, tests.md's Run Results section reports
+    "Could not execute", tests_passed/test_summary come back None, and BugFixer never
+    runs at all (bugfix_path stays None, no warning -- this is the expected default state,
+    not a degraded one)."""
     out_dir = Path(output_dir) if output_dir else Path(config.OUTPUT_DIR) / run_id
     spec_path = out_dir / "agreed_spec.md"
     if not spec_path.is_file():
@@ -240,6 +249,7 @@ async def run_build(
         "warnings": [],
         "tests_passed": None,
         "test_summary": None,
+        "bugfix_path": None,
     }
 
     # --- Architect ---
@@ -450,8 +460,66 @@ async def run_build(
     else:
         result["tests_path"] = None
 
-    # Final files_updated: recomputed, not the Coder-step snapshot, since Reviewer/Tester
-    # may have added/changed files too (e.g. Tester's own test files). In target_mode this
+    # --- BugFixer (Stage 15, opt-in only) ---
+    # Only runs when allow_exec is set AND the Tester actually produced tests.md -- if
+    # Tester itself failed twice, there's no Run Results to act on and nothing review-only
+    # to chase (BugFixer's own scope excludes review issues with no failing test behind
+    # them), so skipping is the right "nothing to do" outcome, not a degraded one.
+    if allow_exec and tests_text is not None:
+        bugfixer_prompt_file, bugfixer_mode, bugfixer_timeout = config.BUILD_AGENTS["BugFixer"]
+        bugfixer_stdin = (
+            "=== REVIEW ===\n"
+            + (
+                review_text.strip()
+                if review_text is not None
+                else "Reviewer was unavailable this run; no review.md was produced."
+            )
+            + "\n\n=== TEST RESULTS (tests.md) ===\n"
+            + tests_text.strip()
+            + "\n"
+        )
+        bugfixer_instruction = (
+            "Read the review and test results on stdin, and the code and tests in the current "
+            "working directory, then fix only what Run Results shows as actually failing and "
+            "follow your stdout-format rules exactly."
+        )
+        bugfix_text, _bugfixer_cost, bugfixer_truncated = await _run_step(
+            bus,
+            agent="BugFixer",
+            system_prompt_file=bugfixer_prompt_file,
+            stdin_text=bugfixer_stdin,
+            instruction=bugfixer_instruction,
+            mode=bugfixer_mode,
+            cost_state=cost_state,
+            cwd=str(build_dir),
+            timeout=bugfixer_timeout,
+            model=model,
+            effort=effort,
+            max_turns=config.BUGFIXER_MAX_TURNS,
+        )
+        result["total_cost_usd"] = cost_state[0]
+        if bugfixer_truncated:
+            result["warnings"].append("BugFixer hit the turn limit; using the output produced so far.")
+
+        # A failed BugFixer (two attempts, per _run_step) isn't terminal -- Tester's
+        # already-written tests.md still stands as the final result, same "not fatal"
+        # treatment as a Reviewer failure earlier in this pipeline. bugfix_path/warning
+        # are the only visible trace; no separate error path needed here.
+        if bugfix_text is not None:
+            bugfix_path = out_dir / "bugfix.md"
+            bugfix_path.write_text(bugfix_text, encoding="utf-8")
+            result["bugfix_path"] = str(bugfix_path)
+            # Refresh tests_passed/test_summary from BugFixer's own re-run when it did one
+            # (its "Re-run Results" section) -- "Not re-run" / "No fixes needed" won't
+            # match the parser, so the original Tester-reported status is left untouched
+            # in that case, which is the correct outcome (nothing changed).
+            rerun_passed, rerun_summary = _parse_test_results(bugfix_text)
+            if rerun_summary is not None:
+                result["tests_passed"], result["test_summary"] = rerun_passed, rerun_summary
+
+    # Final files_updated: recomputed, not the Coder-step snapshot, since Reviewer/Tester/
+    # BugFixer may have added/changed files too (e.g. Tester's own test files, or
+    # BugFixer's source edits when allow_exec is set). In target_mode this
     # is the touched-files-only list (not the whole sandbox tree -- a real target codebase
     # can have hundreds of unrelated files, and dumping all of them into the UI's file
     # panel on every files_updated would be noise); a real target_mode also writes
@@ -530,6 +598,7 @@ async def _headless_main(run_id: str, target_mode: bool = False, allow_exec: boo
     print(f"tests: {result['tests_path']}")
     if result.get("test_summary"):
         print(f"test_summary: {result['test_summary']} (tests_passed={result['tests_passed']})")
+    print(f"bugfix: {result['bugfix_path']}")
     print(f"patch_diff: {result['patch_diff_path']}")
     print(f"total_cost_usd: ${result['total_cost_usd']:.4f}")
     if result.get("warnings"):
