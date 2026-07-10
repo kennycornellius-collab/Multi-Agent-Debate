@@ -12,25 +12,42 @@ import sys
 
 ECHO_TIMEOUT = 60
 
+# Resolve the CLI once, exactly as agents/runner.py does, and invoke it by this full path
+# rather than the bare name "claude". shutil.which() honors PATHEXT, so it locates a
+# .cmd/.ps1/.exe shim; but a bare "claude" handed to subprocess.run (no shell) goes through
+# CreateProcess, which only appends ".exe" -- so on a shim install the shutil.which() gate
+# (step 1 below) would pass while the version/echo calls raised FileNotFoundError. None here
+# means the CLI is not on PATH at all.
+CLAUDE_BIN = shutil.which("claude")
+
 
 def _run(args: list[str], *, stdin_text: str | None = None, timeout: int) -> subprocess.CompletedProcess:
     # encoding= matters: text=True alone decodes the CLI's output with the locale codepage
     # (cp1252 on Windows) in strict mode, which can raise UnicodeDecodeError on non-ASCII
     # output -- see agents/build.py's _git_diff for the full note.
-    return subprocess.run(
-        args,
-        input=stdin_text,
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-    )
+    #
+    # OSError (FileNotFoundError for a non-executable shim, a permission error, ...) is
+    # turned into a failed CompletedProcess rather than propagated: run_preflight promises
+    # never to raise, because main.py calls it from the lifespan hook where any exception
+    # crashes server startup instead of showing the friendly CLI-not-ready banner.
+    # TimeoutExpired is NOT an OSError and still propagates to the call-site handlers.
+    try:
+        return subprocess.run(
+            args,
+            input=stdin_text,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except OSError as e:
+        return subprocess.CompletedProcess(args, returncode=127, stdout="", stderr=str(e))
 
 
 def run_preflight() -> tuple[bool, str]:
     """Returns (ok, human-readable message). Never raises."""
     # 1. Is the binary even on PATH?
-    if shutil.which("claude") is None:
+    if CLAUDE_BIN is None:
         return False, (
             "Claude Code CLI not found on PATH.\n"
             "Install it first — see https://docs.claude.com/en/docs/claude-code/overview — "
@@ -39,7 +56,7 @@ def run_preflight() -> tuple[bool, str]:
 
     # 2. Version check
     try:
-        r = _run(["claude", "--version"], timeout=30)
+        r = _run([CLAUDE_BIN, "--version"], timeout=30)
     except subprocess.TimeoutExpired:
         return False, "`claude --version` timed out after 30s."
     if r.returncode != 0:
@@ -47,7 +64,7 @@ def run_preflight() -> tuple[bool, str]:
     version = (r.stdout or "").strip()
 
     # 3. Authenticated end-to-end echo test (text-only, single turn)
-    args = ["claude", "-p", "reply with the single word ok", "--tools", "", "--max-turns", "1"]
+    args = [CLAUDE_BIN, "-p", "reply with the single word ok", "--tools", "", "--max-turns", "1"]
     try:
         r = _run(args, stdin_text="hi\n", timeout=ECHO_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -58,7 +75,7 @@ def run_preflight() -> tuple[bool, str]:
         # Flag-compatibility fallback: older/newer CLIs may not know --tools
         if "--tools" in err or "unknown option" in err.lower() or "unrecognized" in err.lower():
             try:
-                r2 = _run(["claude", "-p", "reply with the single word ok", "--max-turns", "1"],
+                r2 = _run([CLAUDE_BIN, "-p", "reply with the single word ok", "--max-turns", "1"],
                           stdin_text="hi\n", timeout=ECHO_TIMEOUT)
             except subprocess.TimeoutExpired:
                 return False, f"Echo test (fallback) timed out after {ECHO_TIMEOUT}s."
