@@ -69,7 +69,12 @@ def _init_baseline_commit(build_dir: Path) -> tuple[bool, bool, Optional[str]]:
         pass  # best-effort only -- a write failure here shouldn't abort sandbox prep
 
     def _run(args: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(args, cwd=build_dir, capture_output=True, text=True)
+        # encoding= matters: text=True alone decodes git's output with the locale codepage
+        # (cp1252 on Windows) in strict mode, which can raise UnicodeDecodeError on
+        # non-ASCII paths/messages -- see agents/build.py's _git_diff for the full note.
+        return subprocess.run(
+            args, cwd=build_dir, capture_output=True, encoding="utf-8", errors="replace"
+        )
 
     steps = [
         ["git", "init", "-q"],

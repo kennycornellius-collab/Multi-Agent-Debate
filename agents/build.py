@@ -96,11 +96,14 @@ def _git_diff(build_dir: Path) -> tuple[str, list[str]]:
     files and would silently miss anything the Coder created from scratch. Safe to call
     more than once in the same build (e.g. once after Coder, again after Tester); each
     call reflects the cumulative working-tree state at that moment."""
-    subprocess.run(["git", "add", "-A"], cwd=build_dir, capture_output=True, text=True)
-    diff = subprocess.run(["git", "diff", "--cached"], cwd=build_dir, capture_output=True, text=True)
-    names = subprocess.run(
-        ["git", "diff", "--cached", "--name-only"], cwd=build_dir, capture_output=True, text=True
-    )
+    # encoding= is required, not just tidy: git emits raw UTF-8 file bytes in diffs, and
+    # text=True alone decodes with the locale codepage (cp1252 on Windows) in strict mode --
+    # a single curly quote in changed content (U+201D is byte 0x9d, undefined in cp1252)
+    # would raise UnicodeDecodeError and kill the whole run at the diff step.
+    _dec = {"capture_output": True, "encoding": "utf-8", "errors": "replace"}
+    subprocess.run(["git", "add", "-A"], cwd=build_dir, **_dec)
+    diff = subprocess.run(["git", "diff", "--cached"], cwd=build_dir, **_dec)
+    names = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=build_dir, **_dec)
     files = sorted(f for f in names.stdout.splitlines() if f.strip())
     return diff.stdout, files
 

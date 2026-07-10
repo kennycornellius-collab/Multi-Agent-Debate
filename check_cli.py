@@ -14,11 +14,15 @@ ECHO_TIMEOUT = 60
 
 
 def _run(args: list[str], *, stdin_text: str | None = None, timeout: int) -> subprocess.CompletedProcess:
+    # encoding= matters: text=True alone decodes the CLI's output with the locale codepage
+    # (cp1252 on Windows) in strict mode, which can raise UnicodeDecodeError on non-ASCII
+    # output -- see agents/build.py's _git_diff for the full note.
     return subprocess.run(
         args,
         input=stdin_text,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
     )
 
