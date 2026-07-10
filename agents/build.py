@@ -88,6 +88,15 @@ def _changed_files(pre: dict[str, str], post: dict[str, str]) -> list[str]:
     return sorted(f for f in set(pre) | set(post) if pre.get(f) != post.get(f))
 
 
+class _GitDiffError(Exception):
+    """A git step inside _git_diff exited nonzero. Distinct from an empty-but-successful
+    diff on purpose: a failed `git add -A` (index.lock held by another process, an
+    over-long Windows path, ...) leaves the staged set stale, and reading the resulting
+    empty diff as "no changes" would make run_build misreport real Coder work as
+    coder_made_no_changes and skip Reviewer/Tester. Both call sites catch this and
+    degrade with a warning -- same degrade-don't-die treatment as the no-git path."""
+
+
 def _git_diff(build_dir: Path) -> tuple[str, list[str]]:
     """Codebase Analysis Mode (target_mode), diff_available path: the cumulative diff
     against the sandbox's baseline commit (see agents/sandbox.py's _init_baseline_commit),
@@ -95,17 +104,28 @@ def _git_diff(build_dir: Path) -> tuple[str, list[str]]:
     as additions in `git diff --cached` -- a plain `git diff` only covers already-tracked
     files and would silently miss anything the Coder created from scratch. Safe to call
     more than once in the same build (e.g. once after Coder, again after Tester); each
-    call reflects the cumulative working-tree state at that moment."""
-    # encoding= is required, not just tidy: git emits raw UTF-8 file bytes in diffs, and
-    # text=True alone decodes with the locale codepage (cp1252 on Windows) in strict mode --
-    # a single curly quote in changed content (U+201D is byte 0x9d, undefined in cp1252)
-    # would raise UnicodeDecodeError and kill the whole run at the diff step.
-    _dec = {"capture_output": True, "encoding": "utf-8", "errors": "replace"}
-    subprocess.run(["git", "add", "-A"], cwd=build_dir, **_dec)
-    diff = subprocess.run(["git", "diff", "--cached"], cwd=build_dir, **_dec)
-    names = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=build_dir, **_dec)
-    files = sorted(f for f in names.stdout.splitlines() if f.strip())
-    return diff.stdout, files
+    call reflects the cumulative working-tree state at that moment.
+
+    Raises _GitDiffError if any git step exits nonzero -- see its docstring for why a
+    failed step must not be allowed to read as an empty diff."""
+
+    def _run(args: list[str]) -> str:
+        # encoding= is required, not just tidy: git emits raw UTF-8 file bytes in diffs,
+        # and text=True alone decodes with the locale codepage (cp1252 on Windows) in
+        # strict mode -- a single curly quote in changed content (U+201D is byte 0x9d,
+        # undefined in cp1252) would kill the decode in subprocess's reader thread and
+        # hand back stdout=None instead of the diff.
+        r = subprocess.run(args, cwd=build_dir, capture_output=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            tail = (r.stderr or r.stdout or "").strip()[-300:]
+            raise _GitDiffError(f"`{' '.join(args)}` exited {r.returncode}: {tail}")
+        return r.stdout
+
+    _run(["git", "add", "-A"])
+    diff = _run(["git", "diff", "--cached"])
+    names = _run(["git", "diff", "--cached", "--name-only"])
+    files = sorted(f for f in names.splitlines() if f.strip())
+    return diff, files
 
 
 async def _run_step(
@@ -219,7 +239,10 @@ async def run_build(
     Coder swaps to `config.CODER_PATCH_PROMPT_FILE` (edit-in-place persona), and the old
     "did build/ end up non-empty?" guard is replaced by "did anything actually change?":
     an empty diff after the Coder's turn is treated the same way empty-build-dir was
-    before -- error event, Reviewer/Tester skipped. Reviewer and Tester run completely
+    before -- error event, Reviewer/Tester skipped. (Only a *successful* empty diff counts:
+    if git itself fails during that check, the run degrades with a warning and continues
+    rather than misreporting real Coder work as "no changes" -- see _GitDiffError.)
+    Reviewer and Tester run completely
     unchanged in target_mode; their prompts don't differ between a fresh tree and a
     patched existing one (SPEC.md). `diff_available` (from that same prior sandbox-prep
     call) picks the change-detection mechanism: a real `git diff` against the sandbox's
@@ -362,9 +385,23 @@ async def run_build(
     if coder_truncated:
         result["warnings"].append("Coder hit the turn limit; using the output produced so far.")
 
+    git_diff_failed = False
     if target_mode:
         if diff_available:
-            _, files = await asyncio.to_thread(_git_diff, build_dir)
+            try:
+                _, files = await asyncio.to_thread(_git_diff, build_dir)
+            except _GitDiffError as e:
+                # Can't tell what (if anything) the Coder changed -- but an empty list
+                # here means git broke, not that no changes exist, so it must not flow
+                # into the coder_made_no_changes skip below. Assume the Coder did work
+                # and keep the pipeline going; the cost is change detection (and likely
+                # patch.diff) for this run, not Reviewer/Tester.
+                git_diff_failed = True
+                files = []
+                result["warnings"].append(
+                    f"git change detection failed after the Coder step ({e}); assuming "
+                    "the Coder made changes and continuing."
+                )
         else:
             post_snapshot = await asyncio.to_thread(_hash_files, build_dir)
             files = _changed_files(pre_snapshot, post_snapshot)
@@ -374,7 +411,7 @@ async def run_build(
             )
     else:
         files = _walk_build_dir(build_dir)
-    build_ok = bool(files)
+    build_ok = bool(files) or git_diff_failed
     result["build_ok"] = build_ok
 
     if not build_ok:
@@ -397,7 +434,8 @@ async def run_build(
         )
         return result
 
-    bus.emit(AgentEvent(type="files_updated", phase="build", content=json.dumps(files)))
+    if files:  # empty only when git_diff_failed: nothing meaningful to show yet
+        bus.emit(AgentEvent(type="files_updated", phase="build", content=json.dumps(files)))
 
     # --- Reviewer ---
     reviewer_prompt_file, reviewer_mode, reviewer_timeout = config.BUILD_AGENTS["Reviewer"]
@@ -555,16 +593,26 @@ async def run_build(
     # panel on every files_updated would be noise); a real target_mode also writes
     # patch.diff here, once, covering the whole build phase's cumulative changes.
     if target_mode:
+        final_files: Optional[list[str]] = None
         if diff_available:
-            diff_text, final_files = await asyncio.to_thread(_git_diff, build_dir)
-            if diff_text:
-                patch_path = out_dir / "patch.diff"
-                patch_path.write_text(diff_text, encoding="utf-8")
-                result["patch_diff_path"] = str(patch_path)
+            # Attempted even if the post-Coder _git_diff already failed: `git add -A`
+            # restages everything cumulatively, so a transient failure back then (e.g. a
+            # since-released index.lock) can still yield a complete patch.diff here.
+            try:
+                diff_text, final_files = await asyncio.to_thread(_git_diff, build_dir)
+                if diff_text:
+                    patch_path = out_dir / "patch.diff"
+                    patch_path.write_text(diff_text, encoding="utf-8")
+                    result["patch_diff_path"] = str(patch_path)
+            except _GitDiffError as e:
+                result["warnings"].append(
+                    f"git failed while producing the final diff ({e}); no patch.diff this run."
+                )
         else:
             post_snapshot = await asyncio.to_thread(_hash_files, build_dir)
             final_files = _changed_files(pre_snapshot, post_snapshot)
-        bus.emit(AgentEvent(type="files_updated", phase="build", content=json.dumps(final_files)))
+        if final_files is not None:
+            bus.emit(AgentEvent(type="files_updated", phase="build", content=json.dumps(final_files)))
     else:
         bus.emit(
             AgentEvent(type="files_updated", phase="build", content=json.dumps(_walk_build_dir(build_dir)))
