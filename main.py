@@ -17,11 +17,13 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.datastructures import Headers
 
 import config
 from agents.build import run_build
@@ -51,6 +53,58 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Multi-Agent Debate & Build Pipeline", lifespan=lifespan)
+
+
+def _trusted_hostname(value: Optional[str]) -> bool:
+    """True if `value` -- a Host header ("127.0.0.1:8000", "[::1]:8000") or an Origin URL
+    ("http://localhost:8000") -- names a config.TRUSTED_HOSTS hostname. Port is ignored;
+    anything unparseable (including the literal Origin "null" a sandboxed iframe sends,
+    which urlsplit reads as hostname "null") is untrusted."""
+    if not value:
+        return False
+    try:
+        # A bare Host header has no scheme; "//" prefix makes urlsplit treat it as a
+        # netloc (handling ports and [::1] brackets) instead of a path.
+        hostname = urlsplit(value if "//" in value else f"//{value}").hostname
+    except ValueError:
+        return False
+    return hostname in config.TRUSTED_HOSTS
+
+
+class LocalOnlyMiddleware:
+    """Reject requests that don't look like they come from this machine's own user (see
+    config.TRUSTED_HOSTS for the threat model: CSRF + DNS rebinding against a local,
+    unauthenticated server whose POSTs spend real quota and can execute code).
+
+    Pure ASGI rather than Starlette's BaseHTTPMiddleware on purpose: BaseHTTPMiddleware
+    re-wraps streaming responses, which can delay client-disconnect detection on the
+    long-lived SSE endpoint -- this way /stream passes through untouched."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http":
+            headers = Headers(scope=scope)
+            if not _trusted_hostname(headers.get("host")):
+                response = PlainTextResponse(
+                    "rejected: Host header is not a local hostname (see config.TRUSTED_HOSTS)",
+                    status_code=403,
+                )
+                await response(scope, receive, send)
+                return
+            origin = headers.get("origin")
+            if origin is not None and not _trusted_hostname(origin):
+                response = PlainTextResponse(
+                    "rejected: cross-origin request (see config.TRUSTED_HOSTS)",
+                    status_code=403,
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(LocalOnlyMiddleware)
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

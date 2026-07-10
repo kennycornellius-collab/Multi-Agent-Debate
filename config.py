@@ -185,3 +185,22 @@ RATE_LIMIT_TRANSIENT_MARKER = "request rejected (429)"  # a transient API-tier r
 RATE_LIMIT_POLL_SECONDS = 900       # fallback wait when no reset time is parseable (15 min)
 RATE_LIMIT_HEARTBEAT_SECONDS = 30   # how often a `paused` heartbeat event re-emits while waiting
 API_429_BACKOFF_SECONDS = 30        # short backoff for RATE_LIMIT_TRANSIENT_MARKER
+
+# Local-only HTTP guard (main.py's LocalOnlyMiddleware): this server is an unauthenticated
+# single-user tool, and starting a run costs real subscription quota (and, with
+# allow_test_execution, executes code) -- so every request must look like it comes from
+# this machine's own user, not a webpage the user happens to have open. Two checks, both
+# against this hostname allowlist (port ignored):
+#   - Host header: DNS-rebinding defense, and the primary reason this exists. POST /run
+#     only parses its JSON body under Content-Type: application/json, which is not a
+#     CORS-"simple" type -- so a plain cross-origin fetch triggers a preflight this server
+#     never answers. But an attacker who rebinds their domain to 127.0.0.1 becomes
+#     same-origin (no preflight, body parsed); the rebound request carries the attacker's
+#     domain in Host, so this allowlist is what rejects it.
+#   - Origin header (when present): CSRF defense-in-depth for mutating endpoints that read
+#     no JSON body (e.g. POST /run/{id}/cancel), which a cross-origin simple request can
+#     otherwise reach without a preflight. A browser always stamps such a request with the
+#     initiating page's Origin; the UI's own same-origin requests carry a local one, and
+#     curl/scripts send none at all and pass untouched.
+# Deliberately serving on a LAN interface (uvicorn --host 0.0.0.0)? Add that hostname/IP here.
+TRUSTED_HOSTS = ["localhost", "127.0.0.1", "::1"]
