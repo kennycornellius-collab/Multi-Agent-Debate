@@ -549,6 +549,28 @@ async def _run_once(
             except asyncio.CancelledError:
                 pass
         raise
+    except Exception as e:
+        # Any other failure while reading the stream -- most concretely a ValueError
+        # ("Separator is found, but chunk is longer than limit") when a single stream-json
+        # line exceeds config.STREAM_READ_LIMIT_BYTES (e.g. a builder-mode tool result
+        # embedding a very large file). Without this branch the exception would propagate
+        # with the claude subprocess still alive and its stdout pipe full/blocked -- an
+        # orphaned process -- and stderr_task left unretrieved. Mirror the timeout/cancel
+        # cleanup, then surface it as an AgentError so the caller's retry-once/error path
+        # handles it uniformly instead of as a bare "internal error".
+        #
+        # Must stay below `except asyncio.TimeoutError` (TimeoutError IS an Exception
+        # subclass and would otherwise be caught here and mislabeled). CancelledError is a
+        # BaseException, not Exception, so it is never swallowed by this clause regardless.
+        await _kill_process_tree(proc)
+        stdin_task.cancel()
+        if stderr_task is not None:
+            stderr_task.cancel()
+            try:
+                await stderr_task
+            except asyncio.CancelledError:
+                pass
+        raise AgentError(f"stream read failed: {e}") from e
     finally:
         # Never leave the feeder task unretrieved -- it only ever swallows its own errors.
         try:
