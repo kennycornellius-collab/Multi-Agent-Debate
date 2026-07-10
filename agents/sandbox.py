@@ -24,6 +24,33 @@ import config
 from agents.events import AgentEvent, EventBus
 
 
+_GITIGNORE_MARKER = "# added by the debate pipeline -- build-artifact noise, not part of the real diff"
+
+
+def _ensure_build_artifact_gitignore(build_dir: Path) -> None:
+    """Append (never overwrite) config.SANDBOX_IGNORE's noise patterns to the
+    sandbox's .gitignore before the baseline commit, so a later Test Execution run's
+    dependency/cache directories (node_modules/, __pycache__/, .pytest_cache/, ...)
+    are excluded from every future `git add -A` / `git diff --cached` in
+    agents/build.py's _git_diff -- otherwise they'd show up as "new files" in
+    patch.diff. Preserves the target codebase's own .gitignore if it already has
+    one; only patterns not already present get added. ".git" itself is skipped --
+    git ignores its own directory implicitly."""
+    patterns = [f"{name}/" for name in config.SANDBOX_IGNORE if name != ".git"]
+    gitignore_path = build_dir / ".gitignore"
+    existing = gitignore_path.read_text(encoding="utf-8", errors="replace") if gitignore_path.is_file() else ""
+    existing_lines = {line.strip() for line in existing.splitlines()}
+    missing = [p for p in patterns if p not in existing_lines]
+    if not missing:
+        return
+    addition = (
+        ("\n" if existing and not existing.endswith("\n") else "")
+        + _GITIGNORE_MARKER + "\n" + "\n".join(missing) + "\n"
+    )
+    with gitignore_path.open("a", encoding="utf-8") as f:
+        f.write(addition)
+
+
 def _init_baseline_commit(build_dir: Path) -> tuple[bool, bool, Optional[str]]:
     """Best-effort: git-init + one baseline commit inside build_dir, using an inline
     author identity and with signing/hooks disabled for this single internal commit
@@ -35,6 +62,11 @@ def _init_baseline_commit(build_dir: Path) -> tuple[bool, bool, Optional[str]]:
     """
     if shutil.which("git") is None:
         return False, False, "git not found on PATH; patch.diff will be unavailable this run"
+
+    try:
+        _ensure_build_artifact_gitignore(build_dir)
+    except OSError:
+        pass  # best-effort only -- a write failure here shouldn't abort sandbox prep
 
     def _run(args: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(args, cwd=build_dir, capture_output=True, text=True)

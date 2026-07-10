@@ -48,16 +48,31 @@ def _parse_test_results(text: Optional[str]) -> tuple[Optional[bool], Optional[s
     return (failed == 0 and errors == 0), summary
 
 
+def _is_build_artifact(rel_parts: tuple[str, ...]) -> bool:
+    """True if any path component matches config.SANDBOX_IGNORE -- mirrors the
+    name-at-any-level semantics shutil.ignore_patterns already uses for the initial
+    sandbox copy (agents/sandbox.py), extended here to post-hoc listings so a Test
+    Execution run's node_modules/__pycache__/.pytest_cache/etc. never surfaces as a
+    real project file in the Output Files panel or (via _hash_files below) the
+    no-git diff fallback."""
+    return any(part in config.SANDBOX_IGNORE for part in rel_parts)
+
+
 def _walk_build_dir(build_dir: Path) -> list[str]:
     """Recursive relative-path listing of every file under build_dir, sorted for
-    determinism. Empty list if the directory doesn't exist or has no files."""
+    determinism. Skips anything under a config.SANDBOX_IGNORE-named directory (see
+    _is_build_artifact). Empty list if the directory doesn't exist or has no files."""
     if not build_dir.is_dir():
         return []
-    return sorted(
-        str(p.relative_to(build_dir)).replace("\\", "/")
-        for p in build_dir.rglob("*")
-        if p.is_file()
-    )
+    files = []
+    for p in build_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(build_dir)
+        if _is_build_artifact(rel.parts):
+            continue
+        files.append(str(rel).replace("\\", "/"))
+    return sorted(files)
 
 
 def _hash_files(build_dir: Path) -> dict[str, str]:
@@ -383,15 +398,27 @@ async def run_build(
 
     # --- Reviewer ---
     reviewer_prompt_file, reviewer_mode, reviewer_timeout = config.BUILD_AGENTS["Reviewer"]
+    # Same combined-stdin pattern as the Coder step above: Reviewer's cwd is build_dir,
+    # not out_dir, so it has no way to read architecture.md via its own file tools --
+    # without this it could only ever check code against the spec's Requirements, never
+    # against the Architect's actual blueprint (component boundaries, interfaces).
+    reviewer_stdin = (
+        "=== AGREED SPEC ===\n"
+        + spec_text.strip()
+        + "\n\n=== ARCHITECTURE ===\n"
+        + arch_text.strip()
+        + "\n"
+    )
     reviewer_instruction = (
-        "Read the agreed spec on stdin and the code in the current working directory, "
-        "then produce the review document now, following your output-format rules exactly."
+        "Read the agreed spec and architecture blueprint on stdin and the code in the current "
+        "working directory, then produce the review document now, following your output-format "
+        "rules exactly."
     )
     review_text, _review_cost, review_truncated = await _run_step(
         bus,
         agent="Reviewer",
         system_prompt_file=reviewer_prompt_file,
-        stdin_text=spec_text,
+        stdin_text=reviewer_stdin,
         instruction=reviewer_instruction,
         mode=reviewer_mode,
         cost_state=cost_state,

@@ -4,7 +4,7 @@
   const STORAGE_KEY = "debate-pipeline-run";
   const BUILD_ORDER = ["Architect", "Coder", "Reviewer", "Tester"];
   const DEBATE_ORDER = ["Strategist", "Critic", "Refiner"];
-  const FILE_PRIORITY = ["agreed_spec.md", "architecture.md", "review.md", "tests.md"];
+  const FILE_PRIORITY = ["agreed_spec.md", "architecture.md", "review.md", "tests.md", "bugfix.md", "patch.diff"];
   const SCROLL_BOTTOM_THRESHOLD = 40;
   const MODEL_CHECK_DEBOUNCE_MS = 400;
 
