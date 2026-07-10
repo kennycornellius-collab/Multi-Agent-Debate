@@ -23,12 +23,18 @@ import config
 from agents.events import AgentEvent, EventBus
 from agents.runner import AgentError, run_agent_streaming
 
-# Matches both Tester's "## Run Results" and BugFixer's "## Re-run Results" (Stage 15) --
-# same PASSED/FAILED/ERRORS body shape in both, so one shared parser covers tests.md and
+# Locates Tester's "## Run Results" / BugFixer's "## Re-run Results" heading (Stage 15) --
+# same PASSED/FAILED/ERRORS body in both, so one shared parser covers tests.md and
 # bugfix.md alike.
-_RUN_RESULTS_RE = re.compile(
-    r"##\s*(?:Run|Re-run) Results\s*\n+PASSED:\s*(\d+),\s*FAILED:\s*(\d+),\s*ERRORS:\s*(\d+)",
-    re.IGNORECASE,
+_RESULTS_HEADING_RE = re.compile(r"##\s*(?:Run|Re-run) Results", re.IGNORECASE)
+# The counts line itself, matched anywhere on its line rather than pinned to the heading's
+# immediate next line. tester.txt/bugfixer.txt DISPLAY this line wrapped in backticks, and
+# a model may also bullet it or prefix a word of prose -- pinning "PASSED:" to line-start
+# right after the heading (the old regex) silently failed to parse all of those, coming
+# back (None, None) even though real counts were right there. Kept scoped to *after* the
+# Results heading so a stray "PASSED:" elsewhere can't match.
+_RESULTS_COUNTS_RE = re.compile(
+    r"PASSED:\s*(\d+),\s*FAILED:\s*(\d+),\s*ERRORS:\s*(\d+)", re.IGNORECASE
 )
 
 
@@ -37,10 +43,17 @@ def _parse_test_results(text: Optional[str]) -> tuple[Optional[bool], Optional[s
     Execution addon, only populated when allow_exec=True) into (tests_passed,
     test_summary). Returns (None, None) when the section is missing/unparseable -- e.g.
     allow_exec=False, "Could not execute", "Not re-run", or output that didn't follow the
-    format -- rather than raising. This is a display convenience, not a strict contract."""
+    format -- rather than raising. This is a display convenience, not a strict contract.
+
+    Two-step (find the Results heading, then the first counts line after it) rather than
+    one pinned regex, so the counts survive being wrapped in backticks/bullets/prose the
+    way the prompts actually render them -- see _RESULTS_COUNTS_RE."""
     if not text:
         return None, None
-    match = _RUN_RESULTS_RE.search(text)
+    heading = _RESULTS_HEADING_RE.search(text)
+    if not heading:
+        return None, None
+    match = _RESULTS_COUNTS_RE.search(text, heading.end())
     if not match:
         return None, None
     passed, failed, errors = (int(x) for x in match.groups())
@@ -529,11 +542,14 @@ async def run_build(
         result["tests_path"] = None
 
     # --- BugFixer (Stage 15, opt-in only) ---
-    # Only runs when allow_exec is set AND the Tester actually produced tests.md -- if
-    # Tester itself failed twice, there's no Run Results to act on and nothing review-only
-    # to chase (BugFixer's own scope excludes review issues with no failing test behind
-    # them), so skipping is the right "nothing to do" outcome, not a degraded one.
-    if allow_exec and tests_text is not None:
+    # Only runs when allow_exec is set AND Tester's Run Results actually reported failing
+    # tests (tests_passed is False). Skips -- for free, no wasted agent call -- when there
+    # is provably nothing to fix: Tester failed twice (tests_passed None), the tests
+    # couldn't be executed / didn't parse ("Could not execute" -> None), or every test
+    # already passed (True). BugFixer's own prompt would just no-op-and-report in all of
+    # those, so gating here spends nothing to reach the same "nothing to do" outcome.
+    # (tests_passed is set from tests.md just above, using the backtick-tolerant parser.)
+    if allow_exec and result["tests_passed"] is False:
         bugfixer_prompt_file, bugfixer_mode, bugfixer_timeout = config.BUILD_AGENTS["BugFixer"]
         bugfixer_stdin = (
             "=== REVIEW ===\n"

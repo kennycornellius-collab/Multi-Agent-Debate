@@ -531,13 +531,19 @@ async def list_output(run_id: str) -> dict:
     run_dir = (OUTPUT_ROOT / run_id).resolve()
     if not run_dir.is_dir():
         return {"run_id": run_id, "files": []}
-    # Codebase mode's sandbox (agents/sandbox.py) carries its own throwaway `.git/` for
-    # diffing -- internal plumbing, not a user-facing output, and dumping its dozens of
-    # hook/object files into the panel alongside patch.diff/build/*.py would be noise.
+    # Exclude build-artifact noise from the panel: the sandbox's throwaway `.git/` (dozens
+    # of hook/object files -- internal diffing plumbing, not a user output), and the
+    # dependency/cache dirs a Test Execution run creates inside build/ (__pycache__/,
+    # node_modules/, .pytest_cache/, ...). "build" itself is dropped from the exclusion
+    # set: in full/build_only mode output/<run-id>/build/ IS the generated source, so it
+    # must stay listed -- same name-at-any-level intent as agents/build.py's
+    # _walk_build_dir, adjusted for the fact that here build/ is a real top-level output,
+    # not a nested artifact.
+    noise = set(config.SANDBOX_IGNORE) - {"build"}
     files = sorted(
         str(rel).replace("\\", "/")
         for p in run_dir.rglob("*")
-        if p.is_file() and ".git" not in (rel := p.relative_to(run_dir)).parts
+        if p.is_file() and noise.isdisjoint((rel := p.relative_to(run_dir)).parts)
     )
     return {"run_id": run_id, "files": files}
 
