@@ -136,6 +136,8 @@ h1, h2 { margin: 0; }
 .step.done { color: var(--text-muted); font-weight: 600; }
 .step.active .node { background: var(--active); border-color: var(--active); box-shadow: 0 0 0 5px var(--active-tint); }
 .step.active { color: var(--text); }
+.step.error .node { background: var(--danger); border-color: var(--danger); }
+.step.error { color: var(--danger); }
 .step + .step::before { content: ""; width: 1.4rem; height: 1px; background: var(--border); flex: none; }
 .step-sep { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-muted); padding: 0 0.2rem; }
 .step-sep[hidden] { display: none; }

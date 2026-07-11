@@ -57,6 +57,7 @@
     selectedFile: null,
     totalCost: 0,
     modelCheckSeq: 0, // guards against a stale check response overwriting a newer one
+    lastSeq: 0, // highest event seq applied to the UI -- dedupes the server's full replay on reconnect
   };
 
   function clamp(n, lo, hi) {
@@ -231,8 +232,8 @@
     return /cancelled/i.test(content) ? "Cancelled" : "Finished with errors";
   }
 
-  function persistRun(runId, numRounds, mode, allowExec) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ runId, numRounds, mode, allowExec }));
+  function persistRun(runId, numRounds, mode, allowExec, model, effort) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ runId, numRounds, mode, allowExec, model, effort }));
   }
 
   function clearPersistedRun() {
@@ -399,13 +400,23 @@
     if (!key) return;
     const li = trackerListEl.querySelector(`[data-step="${CSS.escape(key)}"]`);
     if (!li) return;
-    li.classList.remove("done", "active");
+    li.classList.remove("done", "active", "error");
     if (cls) li.classList.add(cls);
+  }
+
+  // phase_done's completion sweep must not repaint a failed step green: an "error"
+  // state comes from that agent's final (post-retry) error event, which is the truth
+  // for the whole run once the pipeline moves on. A later agent_start for the same
+  // step (a debate agent's next round) still clears it via setStepState above.
+  function markStepDoneUnlessErrored(key) {
+    const li = trackerListEl.querySelector(`[data-step="${CSS.escape(key)}"]`);
+    if (li && li.classList.contains("error")) return;
+    setStepState(key, "done");
   }
 
   function resetTracker() {
     for (const li of trackerListEl.querySelectorAll(".step")) {
-      li.classList.remove("done", "active");
+      li.classList.remove("done", "active", "error");
     }
   }
 
@@ -445,18 +456,20 @@
         buildFeedMetaEl.textContent = idx === -1 ? ev.agent : `Step ${idx + 1} of ${order.length} · ${ev.agent}`;
         runPhaseLabelEl.textContent = `Build · ${ev.agent}`;
       }
-    } else if (ev.type === "agent_done" || ev.type === "error") {
+    } else if (ev.type === "agent_done") {
       setStepState(stepKeyFor(ev), "done");
+    } else if (ev.type === "error") {
+      setStepState(stepKeyFor(ev), "error");
     } else if (ev.type === "phase_done") {
       if (ev.phase === "sandbox") {
-        setStepState("Sandbox", "done");
+        markStepDoneUnlessErrored("Sandbox");
       } else if (ev.phase === "recon") {
-        setStepState("Recon", "done");
+        markStepDoneUnlessErrored("Recon");
       } else if (ev.phase === "debate") {
-        for (const key of DEBATE_ORDER) setStepState(key, "done");
+        for (const key of DEBATE_ORDER) markStepDoneUnlessErrored(key);
         debateFeedMetaEl.textContent = "Done";
       } else if (ev.phase === "build") {
-        for (const key of activeBuildOrder()) setStepState(key, "done");
+        for (const key of activeBuildOrder()) markStepDoneUnlessErrored(key);
         buildFeedMetaEl.textContent = "Done";
       }
     } else if (ev.type === "run_done") {
@@ -564,9 +577,82 @@
       } catch {
         return;
       }
+      // The server re-sends the whole event history on every new stream connection
+      // (EventBus replay buffer), so any reconnect on a live page would re-apply
+      // deltas already appended to the cards. seq is monotonic per run; skip
+      // anything at or below the high-water mark. state.lastSeq is deliberately
+      // NOT reset here -- only resetFeeds() (a genuinely blank feed) resets it, so
+      // a reconnecting connect() stays dedupe-safe.
+      if (typeof ev.seq === "number") {
+        if (ev.seq <= state.lastSeq) return;
+        state.lastSeq = ev.seq;
+      }
       handleEvent(ev);
     };
+    es.onerror = () => {
+      // CONNECTING here means the browser is auto-retrying on its own (transient
+      // network blip, server briefly unreachable) -- let it; the seq guard above
+      // makes the replay each retry triggers safe. CLOSED means the server
+      // answered the reconnect with an HTTP error (e.g. a 404 from a restarted
+      // server whose in-memory run registry is gone) and the browser has given up
+      // for good -- without this handler the UI stays frozen on
+      // "Recovering…"/Streaming forever.
+      if (es.readyState === EventSource.CLOSED) handleStreamClosed(es, runId);
+    };
     state.eventSource = es;
+  }
+
+  // The stream died and the browser won't retry again. Ask /status what actually
+  // happened to the run and settle the UI accordingly.
+  async function handleStreamClosed(es, runId) {
+    if (state.eventSource !== es || state.runId !== runId) return; // superseded by a newer connect()
+    state.eventSource = null;
+    let message;
+    let forgetRun = false;
+    try {
+      const res = await fetch(`/status/${runId}`);
+      if (res.ok) {
+        // The run still exists server-side (running, or finished while we were
+        // disconnected) -- only this stream connection was rejected. Reconnect:
+        // the replay (deduped by seq) catches up on everything missed, and if the
+        // run already finished it re-delivers run_done, so finishRun settles the
+        // UI through the normal path.
+        runPhaseLabelEl.textContent = "Reconnecting…";
+        setTimeout(() => {
+          if (state.runId === runId && !state.eventSource) connect(runId);
+        }, 2000);
+        return;
+      }
+      if (res.status === 404) {
+        // A restarted server no longer knows this run (in-memory registry, per
+        // SPEC.md) -- its background task is gone, so the run is unrecoverable,
+        // not just detached. Forget it so reload doesn't retry forever.
+        forgetRun = true;
+        message =
+          "The server no longer knows this run (it likely restarted mid-run). " +
+          "Any files already produced are still in the output/ directory on disk.";
+      } else {
+        message = `Live stream closed and the status check failed (${res.status}).`;
+      }
+    } catch {
+      // Server unreachable right now. Keep the persisted run: if the server comes
+      // back still knowing it, a page reload recovers via tryRecoverRun(); if not,
+      // that path's 404 check clears it.
+      message = "Lost connection to the server. Reload the page to retry once it's back.";
+    }
+    if (state.activeCard) {
+      // Stop the orphaned card's "Streaming" pulse -- nothing more is coming.
+      setCardStatus(state.activeCard, "Interrupted");
+      setActiveCard(null);
+    }
+    runBtn.disabled = false;
+    cancelBtn.hidden = true;
+    setConfigCollapsed(false);
+    hidePaused();
+    runPhaseLabelEl.textContent = "Connection lost";
+    runDotEl.className = "dot error";
+    if (forgetRun) clearPersistedRun();
+    showError(message);
   }
 
   function finishRun(content) {
@@ -603,6 +689,8 @@
     buildFeedBody.replaceChildren();
     state.cards.clear();
     state.activeCard = null;
+    state.lastSeq = 0; // blank feed -- the next connect()'s replay must apply from seq 1
+
     fileListEl.replaceChildren();
     fileViewEl.textContent = "Select a file to view its contents.";
     fileCountEl.textContent = "0 Files";
@@ -689,7 +777,7 @@
       runPhaseLabelEl.textContent = "Starting…";
       runDotEl.className = "dot active pulse";
       if (mode === "codebase") setStepState("Sandbox", "active"); // sandbox prep emits no agent_start (SPEC.md: plain code, zero agent calls)
-      persistRun(data.run_id, numRounds, mode, allowExec);
+      persistRun(data.run_id, numRounds, mode, allowExec, model, effort);
       connect(data.run_id);
     } catch (err) {
       showError(`Network error starting run: ${err.message}`);
@@ -768,7 +856,7 @@
       clearPersistedRun();
       return;
     }
-    const { runId, numRounds, mode, allowExec } = saved || {};
+    const { runId, numRounds, mode, allowExec, model, effort } = saved || {};
     if (!runId) {
       clearPersistedRun();
       return;
@@ -791,7 +879,16 @@
     state.mode = mode || "full";
     state.allowExec = !!allowExec;
     allowExecCheckbox.checked = !!allowExec;
+    // Restore the form controls to describe the run being recovered, not whatever
+    // the form last held, so the summary chips can't disagree with the actual run.
+    // Model/effort use selectPill directly -- deliberately NOT scheduleModelCheck(),
+    // which spawns a real (billed) CLI availability probe; the run is already using
+    // this model, so availability is moot. Pre-existing localStorage entries that
+    // lack model/effort fall back to "" (the Default pill).
+    roundsInput.value = String(state.numRounds);
     selectPill("mode", state.mode);
+    selectPill("model", model || "");
+    selectPill("effort", effort || "");
     applyModeVisibility(state.mode);
     updateConfigSummary();
     runBtn.disabled = !!status.running;
