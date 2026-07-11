@@ -27,7 +27,7 @@ from agents.events import AgentEvent, EventBus
 _GITIGNORE_MARKER = "# added by the debate pipeline -- build-artifact noise, not part of the real diff"
 
 
-def _ensure_build_artifact_gitignore(build_dir: Path) -> None:
+def _ensure_build_artifact_gitignore(build_dir: Path, src: Path) -> None:
     """Append (never overwrite) config.SANDBOX_IGNORE's noise patterns to the
     sandbox's .gitignore before the baseline commit, so a later Test Execution run's
     dependency/cache directories (node_modules/, __pycache__/, .pytest_cache/, ...)
@@ -35,8 +35,23 @@ def _ensure_build_artifact_gitignore(build_dir: Path) -> None:
     agents/build.py's _git_diff -- otherwise they'd show up as "new files" in
     patch.diff. Preserves the target codebase's own .gitignore if it already has
     one; only patterns not already present get added. ".git" itself is skipped --
-    git ignores its own directory implicitly."""
-    patterns = [f"{name}/" for name in config.SANDBOX_IGNORE if name != ".git"]
+    git ignores its own directory implicitly.
+
+    Audit L5: ambiguous names (config.SANDBOX_GITIGNORE_IF_IN_TARGET -- build/,
+    dist/, ...) are appended only when the directory existed in the target codebase
+    itself, i.e. there's evidence it's that project's artifact dir. A File Plan that
+    legitimately creates e.g. dist/ in a project that never had one therefore stays
+    visible in patch.diff and change detection instead of vanishing silently. Pure
+    cache names are always appended -- no File Plan writes source into __pycache__.
+    (Residual risk, accepted: a fresh-clone target whose own .gitignore doesn't cover
+    an artifact dir that test execution then creates -- e.g. cargo's target/ -- can
+    still leak noise into patch.diff; real projects' own .gitignores cover this.)"""
+    conditional = set(config.SANDBOX_GITIGNORE_IF_IN_TARGET)
+    patterns = [
+        f"{name}/"
+        for name in config.SANDBOX_IGNORE
+        if name != ".git" and (name not in conditional or (src / name).is_dir())
+    ]
     gitignore_path = build_dir / ".gitignore"
     existing = gitignore_path.read_text(encoding="utf-8", errors="replace") if gitignore_path.is_file() else ""
     existing_lines = {line.strip() for line in existing.splitlines()}
@@ -51,7 +66,7 @@ def _ensure_build_artifact_gitignore(build_dir: Path) -> None:
         f.write(addition)
 
 
-def _init_baseline_commit(build_dir: Path) -> tuple[bool, bool, Optional[str]]:
+def _init_baseline_commit(build_dir: Path, src: Path) -> tuple[bool, bool, Optional[str]]:
     """Best-effort: git-init + one baseline commit inside build_dir, using an inline
     author identity and with signing/hooks disabled for this single internal commit
     (user-authorized exception -- this repo is a hidden diff tool inside our own
@@ -64,7 +79,7 @@ def _init_baseline_commit(build_dir: Path) -> tuple[bool, bool, Optional[str]]:
         return False, False, "git not found on PATH; patch.diff will be unavailable this run"
 
     try:
-        _ensure_build_artifact_gitignore(build_dir)
+        _ensure_build_artifact_gitignore(build_dir, src)
     except OSError:
         pass  # best-effort only -- a write failure here shouldn't abort sandbox prep
 
@@ -217,7 +232,9 @@ async def prepare_sandbox(
         )
         return result
 
-    diff_available, baseline_committed, warning = await asyncio.to_thread(_init_baseline_commit, build_dir)
+    diff_available, baseline_committed, warning = await asyncio.to_thread(
+        _init_baseline_commit, build_dir, src
+    )
     result["diff_available"] = diff_available
     result["baseline_committed"] = baseline_committed
     if warning:

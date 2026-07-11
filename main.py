@@ -172,6 +172,12 @@ class RunState:
     # if no reset time was parseable -- see runner.py's _wait_for_quota).
     paused: bool = False
     paused_until: Optional[str] = None
+    # Audit L1 (codebase half): the pipeline's own touched-files list (build/-relative
+    # paths, mirrored off files_updated events by _watch_status). None = no list has
+    # arrived yet (pre-Coder, or git broke and none ever will). list_output uses it to
+    # show only what a codebase-mode run actually changed instead of the whole copied
+    # target tree.
+    touched_files: Optional[list[str]] = None
     task: Optional[asyncio.Task] = None
 
 
@@ -253,6 +259,13 @@ async def _watch_status(state: RunState) -> None:
         elif ev.type == "resumed":
             state.paused = False
             state.paused_until = None
+        elif ev.type == "files_updated":
+            # Each emit is cumulative (the diff is always against the sandbox baseline,
+            # git add -A restages everything), so replace rather than merge.
+            try:
+                state.touched_files = [str(p).replace("\\", "/") for p in json.loads(ev.content)]
+            except (json.JSONDecodeError, TypeError):
+                pass  # malformed payload: keep whatever list we already had
         elif ev.type == "run_done":
             state.running = False
             state.paused = False
@@ -590,6 +603,17 @@ async def list_output(run_id: str) -> dict:
         for p in run_dir.rglob("*")
         if p.is_file() and noise.isdisjoint((rel := p.relative_to(run_dir)).parts)
     )
+    state = runs[run_id]
+    if state.mode == "codebase":
+        # Audit L1 (codebase half): here build/ holds a COPY of the entire target repo --
+        # listing all of it buries the run's real output under hundreds of unrelated
+        # files. Show only what the pipeline itself touched (mirrored off files_updated
+        # by _watch_status); top-level docs (agreed_spec.md, codebase_context.md,
+        # patch.diff, ...) are always listed. Before the Coder has produced anything --
+        # or if git broke and no touched list ever arrived -- build/ entries are hidden
+        # rather than flooding the panel; patch.diff still carries the full changes.
+        touched = {f"build/{p}" for p in (state.touched_files or [])}
+        files = [f for f in files if not f.startswith("build/") or f in touched]
     return {"run_id": run_id, "files": files}
 
 

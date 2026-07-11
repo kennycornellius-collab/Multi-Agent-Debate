@@ -13,9 +13,11 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import venv
 from pathlib import Path
 from typing import Optional
 
@@ -155,6 +157,7 @@ async def _run_step(
     model: Optional[str] = None,
     effort: Optional[str] = None,
     max_turns: Optional[int] = None,
+    env: Optional[dict[str, str]] = None,
 ) -> tuple[Optional[str], float, bool]:
     """Run one build step, streaming deltas onto the bus. Retries once on AgentError;
     on a second failure, emits an `error` event and returns (None, 0.0, False) so the
@@ -187,6 +190,7 @@ async def _run_step(
                 model=model,
                 effort=effort,
                 max_turns=max_turns,
+                env=env,
             ):
                 if event.type == "delta":
                     bus.emit(event)
@@ -225,6 +229,43 @@ async def _run_step(
             return None, 0.0, False
 
     return None, 0.0, False  # unreachable, keeps type checkers happy
+
+
+def _venv_env(venv_dir: Path) -> dict[str, str]:
+    """A copy of the current environment with `venv_dir` activated -- activation IS
+    just env vars: the venv's scripts dir first on PATH (so bare `pip`, `python`,
+    `pytest` resolve into it) plus VIRTUAL_ENV, minus PYTHONHOME (which would override
+    the venv's interpreter paths if a user happened to have it set)."""
+    env = os.environ.copy()
+    scripts = venv_dir / ("Scripts" if os.name == "nt" else "bin")
+    env["VIRTUAL_ENV"] = str(venv_dir)
+    env["PATH"] = f"{scripts}{os.pathsep}{env.get('PATH', '')}"
+    env.pop("PYTHONHOME", None)
+    return env
+
+
+async def _ensure_exec_venv(out_dir: Path) -> tuple[Optional[dict[str, str]], Optional[str]]:
+    """Create (or reuse) the run's disposable venv at output/<run-id>/venv and return
+    (activated-env, warning). Audit L4: exec-mode pip installs previously hit the global
+    environment. The venv lives OUTSIDE build/ so it never pollutes _walk_build_dir /
+    files_updated / patch.diff, and "venv" is already in config.SANDBOX_IGNORE so the
+    Output Files panel filters it. Best-effort: on failure (or EXEC_VENV_PER_RUN=False)
+    returns (None, warning-or-None) and the step runs with the inherited environment --
+    the pre-L4 behavior, degraded loudly rather than aborting an opt-in addon."""
+    if not config.EXEC_VENV_PER_RUN:
+        return None, None
+    venv_dir = out_dir / "venv"
+    try:
+        if not (venv_dir / ("Scripts" if os.name == "nt" else "bin")).is_dir():
+            # with_pip=True runs ensurepip -- a few seconds, no CLI cost. Blocking, so
+            # run it off the event loop like every other blocking call in this module.
+            await asyncio.to_thread(venv.create, str(venv_dir), with_pip=True)
+        return _venv_env(venv_dir), None
+    except (OSError, subprocess.CalledProcessError) as e:
+        return None, (
+            f"could not create the run's venv ({e}); test execution will use the "
+            "global environment this run -- installs are NOT isolated"
+        )
 
 
 async def run_build(
@@ -506,6 +547,7 @@ async def run_build(
     # --- Tester ---
     tester_prompt_file, tester_mode, tester_timeout = config.BUILD_AGENTS["Tester"]
     tester_max_turns: Optional[int] = None
+    exec_env: Optional[dict[str, str]] = None
     if allow_exec:
         # Test Execution addon (SPEC.md v6), opt-in only -- "builder" (registry default)
         # never gets a Bash tool at all, so this only takes effect when a run explicitly
@@ -513,6 +555,13 @@ async def run_build(
         # a Bash tool is actually available to it), so no prompt-file swap is needed here.
         tester_mode = "builder_exec"
         tester_max_turns = config.TESTER_MAX_TURNS
+        # Audit L4: pip installs from an exec-mode agent previously landed in the GLOBAL
+        # environment (arbitrary setup.py code outside the disposable run dir). Every
+        # exec-mode step now runs inside a venv created under output/<run-id>/ -- shared
+        # by Tester and BugFixer, so installed deps persist between the two steps.
+        exec_env, venv_warning = await _ensure_exec_venv(out_dir)
+        if venv_warning:
+            result["warnings"].append(venv_warning)
     tester_instruction = (
         "Read the review on stdin (or use your own judgment if none was produced) and the "
         "code in the current working directory, then create the test files directly and "
@@ -531,6 +580,7 @@ async def run_build(
         model=model,
         effort=effort,
         max_turns=tester_max_turns,
+        env=exec_env,
     )
     result["total_cost_usd"] = cost_state[0]
     if tester_truncated:
@@ -583,6 +633,7 @@ async def run_build(
             model=model,
             effort=effort,
             max_turns=config.BUGFIXER_MAX_TURNS,
+            env=exec_env,
         )
         result["total_cost_usd"] = cost_state[0]
         if bugfixer_truncated:

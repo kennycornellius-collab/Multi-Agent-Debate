@@ -255,7 +255,9 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def _spawn(args: list[str], *, cwd: Optional[str]) -> asyncio.subprocess.Process:
+async def _spawn(
+    args: list[str], *, cwd: Optional[str], env: Optional[dict[str, str]] = None
+) -> asyncio.subprocess.Process:
     if CLAUDE_BIN is None:
         raise AgentError("`claude` CLI not found on PATH", retryable=False)
     return await asyncio.create_subprocess_exec(
@@ -265,6 +267,7 @@ async def _spawn(args: list[str], *, cwd: Optional[str]) -> asyncio.subprocess.P
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
+        env=env,  # None = inherit; builder_exec passes a venv-activated copy (audit L4)
         limit=config.STREAM_READ_LIMIT_BYTES,
     )
 
@@ -349,9 +352,16 @@ async def run_agent_streaming(
     model: Optional[str] = None,
     effort: Optional[str] = None,
     max_turns: Optional[int] = None,
+    env: Optional[dict[str, str]] = None,
     wait_on_rate_limit: bool = True,
 ) -> AsyncIterator[AgentEvent]:
     """Spawn the `claude` CLI for one agent turn and yield AgentEvents as output streams in.
+
+    `env` is an optional full environment for the spawned CLI process (None = inherit).
+    The Test Execution addon passes a venv-activated copy (VIRTUAL_ENV + the venv's
+    scripts dir prepended to PATH) so every Bash command the agent runs -- pip installs
+    above all -- resolves into the run's disposable venv instead of the global
+    environment (audit L4). The claude process's own children inherit it transitively.
 
     Yields `delta` events as text arrives, then a final `result` event carrying the
     full text and reported cost. Raises AgentError on nonzero exit or timeout.
@@ -400,6 +410,7 @@ async def run_agent_streaming(
         model=model,
         effort=effort,
         max_turns=max_turns,
+        env=env,
     )
 
     while True:
@@ -430,6 +441,7 @@ async def _run_once(
     model: Optional[str] = None,
     effort: Optional[str] = None,
     max_turns: Optional[int] = None,
+    env: Optional[dict[str, str]] = None,
 ) -> AsyncIterator[AgentEvent]:
     args = _build_args(
         prompt_path=prompt_path,
@@ -440,7 +452,7 @@ async def _run_once(
         effort=effort,
         max_turns=max_turns,
     )
-    proc = await _spawn(args, cwd=cwd)
+    proc = await _spawn(args, cwd=cwd, env=env)
 
     async def _feed_stdin(p: asyncio.subprocess.Process) -> None:
         try:

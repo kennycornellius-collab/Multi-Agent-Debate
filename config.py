@@ -117,10 +117,23 @@ BUILD_EXEC_ALLOWED_TOOLS = [
     "Bash(bundle install*)", "Bash(rspec*)", "Bash(rake test*)",
 ]
 
+# Audit L4: pip installs from exec-mode agents previously landed in the GLOBAL
+# environment. When True, agents/build.py creates a disposable venv at
+# output/<run-id>/venv and runs Tester/BugFixer with it activated (VIRTUAL_ENV +
+# PATH), so pip/python/pytest resolve into the venv. Python-only isolation: npm/yarn
+# installs are already project-local (plus the -g denylist below); go/cargo caches
+# remain user-level -- consistent with "layered mitigations, not a hard sandbox".
+EXEC_VENV_PER_RUN = True
+
 BUILD_EXEC_DISALLOWED_TOOLS = [
     # Destructive filesystem ops
     "Bash(rm *)", "Bash(rd *)", "Bash(rmdir *)", "Bash(del *)", "Bash(erase *)",
     "Bash(format *)", "Bash(mkfs*)",
+    # Global package installs -- the same escape class audit L4's venv closes for pip.
+    # Prefix-matched like everything here (a reordered `npm install foo -g` slips by;
+    # backstop, not a guarantee).
+    "Bash(npm install -g*)", "Bash(npm install --global*)",
+    "Bash(yarn global*)", "Bash(pnpm add -g*)", "Bash(pnpm add --global*)",
     # Network / remote access
     "Bash(curl *)", "Bash(wget *)", "Bash(nc *)", "Bash(netcat *)",
     "Bash(ssh *)", "Bash(scp *)", "Bash(sftp *)", "Bash(ftp *)",
@@ -140,6 +153,16 @@ SANDBOX_IGNORE = [
     ".git", "node_modules", "__pycache__", ".venv", "venv",
     "dist", "build", ".next", "target", ".mypy_cache", ".pytest_cache",
 ]
+
+# Audit L5: of the names above, these are AMBIGUOUS as sandbox .gitignore entries --
+# they're build-artifact dirs in most projects, but a File Plan can also legitimately
+# create them as real output (a Coder writing a dist/ or build/ dir of its own).
+# agents/sandbox.py appends them to the sandbox's .gitignore only when the directory
+# actually existed in the target codebase (evidence it's that project's artifact dir);
+# the rest of SANDBOX_IGNORE (pure caches: node_modules, __pycache__, .pytest_cache,
+# ...) is always appended -- no File Plan ever writes source into those. Copy
+# exclusion (above) is unaffected; this only controls what git hides from patch.diff.
+SANDBOX_GITIGNORE_IF_IN_TARGET = ["build", "dist", ".next", "target"]
 
 # Identity for the throwaway baseline commit made *inside* the sandbox copy --
 # never the user's own identity, and never written to their global git config.
