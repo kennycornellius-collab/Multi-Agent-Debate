@@ -39,17 +39,51 @@ logger = logging.getLogger(__name__)
 OUTPUT_ROOT = Path(config.OUTPUT_DIR).resolve()
 STATIC_DIR = Path("static")
 
-# Set once at startup by the lifespan hook below; gates POST /run per SPEC.md's
-# error-handling rule ("CLI missing/unauthenticated ... /run returns 503").
-preflight_ok: bool = False
-preflight_message: str = ""
+# Gates POST /run per SPEC.md's error-handling rule ("CLI missing/unauthenticated ...
+# /run returns 503"). None means the background check started by the lifespan hook
+# hasn't produced a verdict yet -- run_preflight() is synchronous and can take up to
+# ~90s (two subprocess timeouts) plus one real billed echo call, so it must not block
+# serving (audit L8). Endpoints that need a verdict await _ensure_preflight_settled();
+# GET / only shows the error banner on a *confirmed* failure (False, not None).
+preflight_ok: Optional[bool] = None
+preflight_message: str = "preflight has not run"
+_preflight_task: Optional[asyncio.Task] = None
+
+
+async def _preflight_background() -> None:
+    global preflight_ok, preflight_message
+    # A worker thread keeps the event loop serving while the blocking check runs.
+    # run_preflight never raises (see check_cli.py / audit M4), so this task can't
+    # die with a stray exception either.
+    ok, message = await asyncio.to_thread(run_preflight)
+    preflight_ok, preflight_message = ok, message
+
+
+async def _ensure_preflight_settled() -> None:
+    """Await the background preflight if it hasn't produced a verdict yet.
+
+    Awaiting an already-finished task returns immediately, so only requests arriving
+    in the first seconds after boot can ever actually wait here. With no lifespan (a
+    bare TestClient), preflight_ok stays None and the 503 gate fires with the
+    "preflight has not run" default -- same refusal the old always-False default gave.
+    """
+    if preflight_ok is None and _preflight_task is not None:
+        await _preflight_task
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global preflight_ok, preflight_message
-    preflight_ok, preflight_message = run_preflight()
+    global _preflight_task
+    _preflight_task = asyncio.create_task(_preflight_background())
     yield
+    if not _preflight_task.done():
+        # Shutting down before the verdict landed: abandon it. The worker thread may
+        # still run its subprocess to completion, but nothing reads the result.
+        _preflight_task.cancel()
+        try:
+            await _preflight_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Multi-Agent Debate & Build Pipeline", lifespan=lifespan)
@@ -378,7 +412,11 @@ def _error_banner_html(message: str) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
-    if not preflight_ok:
+    # `is False`, not `not preflight_ok`: while the background check is still pending
+    # (None) the page must load normally -- blocking or scare-bannering every boot for
+    # a check that almost always passes is exactly what audit L8 flagged. A run
+    # attempted before the verdict waits for it in POST /run's gate instead.
+    if preflight_ok is False:
         return _error_banner_html(preflight_message)
     index_path = STATIC_DIR / "index.html"
     if index_path.is_file():
@@ -399,6 +437,7 @@ async def get_ui_config() -> dict:
 
 @app.post("/run")
 async def start_run(req: RunRequest) -> dict:
+    await _ensure_preflight_settled()
     if not preflight_ok:
         raise HTTPException(status_code=503, detail=preflight_message)
 
@@ -450,6 +489,11 @@ async def cancel_run(run_id: str) -> dict:
     state = runs.get(run_id)
     if state is None:
         raise HTTPException(status_code=404, detail="unknown run_id")
+    if not state.running:
+        # Don't claim a cancellation that can't happen: the run already reached
+        # run_done (finished, failed, or was cancelled earlier). Still 200 -- asking
+        # to stop a stopped run isn't a client error -- just an honest answer.
+        return {"cancelled": False, "detail": "run already finished"}
     if state.task is not None:
         state.task.cancel()
     return {"cancelled": True}
@@ -464,6 +508,7 @@ async def check_model(req: ModelCheckRequest) -> dict:
     same real call and reports what actually happened, instead of guessing from a
     hardcoded list. A valid model incurs one small real call.
     """
+    await _ensure_preflight_settled()
     if not preflight_ok:
         raise HTTPException(status_code=503, detail=preflight_message)
     model = req.model.strip()
