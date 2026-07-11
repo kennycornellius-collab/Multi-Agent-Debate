@@ -25,7 +25,19 @@ STDERR_TAIL_CHARS = 500
 
 
 class AgentError(Exception):
-    """Raised when an agent invocation fails (nonzero exit, timeout, bad setup)."""
+    """Raised when an agent invocation fails (nonzero exit, timeout, bad setup).
+
+    retryable=False marks deterministic failures -- retrying the identical call is
+    guaranteed to fail the same way, so the callers' retry-once loops
+    (debate._run_turn / build._run_step) would just double the cost and wall-clock to
+    reach the same abort (audit M5): a --max-budget-usd exhaustion, a nonexistent
+    model, a missing prompt file, a missing CLI binary. Timeouts and generic nonzero
+    exits stay retryable=True -- those can genuinely be transient.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class RateLimitError(AgentError):
@@ -44,7 +56,7 @@ class RateLimitError(AgentError):
 def _resolve_prompt_file(system_prompt_file: str) -> Path:
     path = Path(config.PROMPTS_DIR) / system_prompt_file
     if not path.is_file():
-        raise AgentError(f"system prompt file not found: {path}")
+        raise AgentError(f"system prompt file not found: {path}", retryable=False)
     return path.resolve()
 
 
@@ -116,7 +128,7 @@ def _build_args(
         ]
         default_model = config.BUILD_MODEL
     else:
-        raise AgentError(f"unknown mode: {mode!r}")
+        raise AgentError(f"unknown mode: {mode!r}", retryable=False)
 
     # An explicit per-call override (e.g. from the browser UI) wins over config.py's
     # per-mode default; config.py's None-means-CLI-default behavior is unchanged for
@@ -245,7 +257,7 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
 
 async def _spawn(args: list[str], *, cwd: Optional[str]) -> asyncio.subprocess.Process:
     if CLAUDE_BIN is None:
-        raise AgentError("`claude` CLI not found on PATH")
+        raise AgentError("`claude` CLI not found on PATH", retryable=False)
     return await asyncio.create_subprocess_exec(
         CLAUDE_BIN,
         *args,
@@ -364,7 +376,7 @@ async def run_agent_streaming(
     False, in which case a usage-limit hit surfaces as an ordinary AgentError.
     """
     if mode in ("builder", "read_only", "builder_exec") and not cwd:
-        raise AgentError(f"mode={mode!r} requires cwd")
+        raise AgentError(f"mode={mode!r} requires cwd", retryable=False)
 
     prompt_path = _resolve_prompt_file(system_prompt_file)
     if timeout is None:
@@ -461,6 +473,8 @@ async def _run_once(
             cost_usd: Optional[float] = None
             is_error = False
             result_subtype: Optional[str] = None
+            api_error_status: Optional[int] = None
+            result_errors: list[str] = []
             rate_limit_payload: Optional[dict] = None
 
             async for raw_line in proc.stdout:
@@ -506,6 +520,12 @@ async def _run_once(
                     cost_usd = obj.get("total_cost_usd")
                     is_error = bool(obj.get("is_error"))
                     result_subtype = obj.get("subtype")
+                    # Both confirmed against the real CLI (audit M5): a budget abort has
+                    # no "result"/stderr text -- its reason lives only in this "errors"
+                    # array; an invalid model reports subtype "success" (!) and reveals
+                    # the failure only via is_error + api_error_status.
+                    api_error_status = obj.get("api_error_status")
+                    result_errors = [str(e) for e in obj.get("errors") or []]
 
                 elif obj_type == "rate_limit_event":
                     # Previously discarded entirely; captured now so a terminal failure
@@ -607,8 +627,19 @@ async def _run_once(
         # stderr is often empty even on failure (e.g. a budget/turn-limit abort reports
         # its reason via the "result" NDJSON event, not stderr) -- prefer whichever
         # actually has content instead of always defaulting to a bare exit code.
-        tail = (stderr_text or result_text or "").strip()[-STDERR_TAIL_CHARS:]
-        raise AgentError(tail or f"claude exited with code {proc.returncode}")
+        tail = (stderr_text or result_text or "; ".join(result_errors) or "").strip()[-STDERR_TAIL_CHARS:]
+        # Deterministic failures skip the caller's retry-once (audit M5). Both
+        # signatures confirmed empirically against the installed CLI:
+        #   - subtype "error_max_budget_usd": --max-budget-usd exhausted mid-call
+        #     (terminal_reason "budget_exhausted"); a retry re-spends the whole budget
+        #     to hit the identical abort.
+        #   - api_error_status 404: nonexistent/inaccessible --model. NOT detectable
+        #     via subtype -- that arrives as "success" with is_error=true.
+        deterministic = result_subtype == "error_max_budget_usd" or api_error_status == 404
+        raise AgentError(
+            tail or f"claude exited with code {proc.returncode}",
+            retryable=not deterministic,
+        )
 
     yield AgentEvent(
         type="result", phase=phase, round=round, agent=agent, content=final_text, cost_usd=cost_usd

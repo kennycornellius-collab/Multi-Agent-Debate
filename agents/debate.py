@@ -90,9 +90,11 @@ async def _run_turn(
     model: Optional[str] = None,
     effort: Optional[str] = None,
 ) -> tuple[Optional[str], float, bool]:
-    """Run one agent turn, streaming deltas onto the bus. Retries once on AgentError;
-    on a second failure, emits an `error` event and returns (None, 0.0, False) so the
-    caller can add a system note and keep the debate going.
+    """Run one agent turn, streaming deltas onto the bus. Retries once on AgentError --
+    unless the error is marked non-retryable (a deterministic failure like a budget
+    abort or invalid model; see AgentError.retryable, audit M5). On a second (or
+    unretryable first) failure, emits an `error` event and returns (None, 0.0, False)
+    so the caller can add a system note and keep the debate going.
 
     `mode`/`cwd` default to a pure text_only turn with no cwd (every debate agent,
     always, before Codebase Analysis Mode existed). Codebase mode's Critic turn is the
@@ -153,7 +155,10 @@ async def _run_turn(
             )
             return full_text, cost_usd, truncated
         except AgentError as e:
-            if attempt == 1:
+            # Deterministic failures (budget abort, invalid model, missing prompt file --
+            # see AgentError.retryable in agents/runner.py) fail identically on a retry;
+            # re-running one just doubles the cost to reach the same abort (audit M5).
+            if attempt == 1 and e.retryable:
                 continue
             tail = str(e).strip()[-500:]
             bus.emit(

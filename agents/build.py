@@ -213,7 +213,10 @@ async def _run_step(
             )
             return full_text, cost_usd, truncated
         except AgentError as e:
-            if attempt == 1:
+            # Deterministic failures skip the retry -- same rationale as debate.py's
+            # _run_turn (audit M5); for a build step the stakes are higher, since a
+            # doomed Coder retry can re-spend the full --max-budget-usd cap.
+            if attempt == 1 and e.retryable:
                 continue
             tail = str(e).strip()[-500:]
             bus.emit(
